@@ -4,9 +4,9 @@ An agent **skill** for building — and repairing — single-file pixel-art web 
 
 **Live demo:** https://tiandihuang.github.io/pixel-art-webgl-component/ — drag the lens, click it, or focus the switch and use the arrow keys.
 
-[![Animated preview: dragging the focus switch from noon to night and back to noon](assets/preview-loop.gif)](https://tiandihuang.github.io/pixel-art-webgl-component/)
+[![Animated preview: dragging the focus switch from noon to night and back to noon](assets/preview-smooth.gif)](https://tiandihuang.github.io/pixel-art-webgl-component/)
 
-*The preview above is a four-second loop of a real drag: day → dusk → night, then the same lens dragged back to day, so the clip closes where it starts. Click it for the live, interactive version.*
+*The preview above is a 13.8 s real-time loop of a genuine drag: day → dusk → night, then the same lens dragged back to day. It is not sped up; the character's walk and typing run at the same pace as the live demo, and the clip closes where it starts. Click it for the interactive version.*
 
 ## What this is
 
@@ -36,7 +36,7 @@ This repository is a skill — a folder of instructions, references, reusable sc
 | `references/worked-example.md` | A map of the reference file: constants, what to adapt, deliberate oddities |
 | `index.html` | GitHub Pages entry: a full-viewport iframe of the worked example |
 | `assets/reference-focus-switch.html` | The complete 72 KB worked example |
-| `assets/preview-loop.gif` | The animated preview above (4.1 s, 33 frames, forward + return) |
+| `assets/preview-smooth.gif` | The animated preview above (13.8 s, 92 frames, real-time forward + return) |
 | `assets/preview.png` | A still frame of the worked example |
 | `scripts/shot.ps1` | Headless Chrome screenshots (GPU, SwiftShader, 2D-only, reduced motion, virtual time) |
 | `scripts/chrome-cdp.ps1` | Launch a debug Chrome with the DevTools port |
