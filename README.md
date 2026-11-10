@@ -2,7 +2,9 @@
 
 An agent **skill** for building — and repairing — single-file pixel-art web components with a WebGL2 compositor: a low-resolution painted room, a liquid-glass lens as the control, OKLab palettes with Bayer-dithered time-of-day light, and a story that moves with the slider.
 
-![The reference focus-mode switch](assets/preview.png)
+**Live demo:** https://tiandihuang.github.io/pixel-art-webgl-component/ — drag the lens, click it, or focus the switch and use the arrow keys.
+
+[![The reference focus-mode switch](assets/preview.png)](https://tiandihuang.github.io/pixel-art-webgl-component/)
 
 *The reference example at 1600×900: a focus-mode switch whose slider is a liquid-glass lens.*
 
@@ -61,7 +63,9 @@ The generated HTML itself has **no** dependencies and works offline.
 
 ## The worked example
 
-Open `assets/reference-focus-switch.html` in Chrome or Edge. On a Windows machine where `.html` is associated with Internet Explorer, double-clicking may open `iexplore.exe` and show only the stage background; that is the viewer, not the file. The verification reference explains how to check and how to open it explicitly.
+The live demo at https://tiandihuang.github.io/pixel-art-webgl-component/ is the reference component running in a full-viewport iframe (`index.html` → `assets/reference-focus-switch.html`); the file is self-contained, so the same experience works when the HTML is opened locally.
+
+Open `assets/reference-focus-switch.html` directly in Chrome or Edge. On a Windows machine where `.html` is associated with Internet Explorer, double-clicking may open `iexplore.exe` and show only the stage background; that is the viewer, not the file. The verification reference explains how to check and how to open it explicitly.
 
 ## Validation
 
