@@ -1,0 +1,23 @@
+﻿{
+  "skill_name": "pixel-art-webgl-component",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "做一个单文件网页组件：胶囊里是一间夜班便利店，滑块是一颗液态玻璃透镜，从左到右是傍晚到凌晨的故事；不要外部库，不要文字。",
+      "expected_output": "One self-contained HTML: 16:9 stage, pixel-art room, liquid-glass lens slider, time/story states, accessible switch, 2D fallback, no external assets or visible labels.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "我做的像素风 WebGL 开关打开后整页只有米色，胶囊和房间都没有；控制台也没报错。帮我查一下。",
+      "expected_output": "Diagnose the viewer first (OS .html association may be IE; chat preview may block scripts), then canvas size, WebGL2, shader failure/canvas lock, 2D fallback. Do not rewrite the art or shader before these are ruled out.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "这个像素房间页面在 150% 缩放的 Windows 上有点糊，而且 1600×900 下上下被裁掉。想保持像素清晰，尽量别裁。",
+      "expected_output": "Fix DPR/canvas backing size and nearest scaling (image-rendering, full devicePixelRatio), explain the integer-k crop tradeoff and a cover-scale alternative; verify with 1280/1600/1920 screenshots.",
+      "files": []
+    }
+  ]
+}

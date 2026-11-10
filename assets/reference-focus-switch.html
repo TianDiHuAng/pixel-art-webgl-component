@@ -1,0 +1,2292 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>专注模式</title>
+<style>
+  :root{ color-scheme: light; }
+  html,body{ height:100%; }
+  body{
+    margin:0; background:#e9e9e9; overflow:hidden;
+    display:grid; place-items:center;
+    font: 400 16px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .stage{
+    position:relative;
+    width:min(100vw, calc(100vh * 16 / 9));
+    height:min(calc(100vw * 9 / 16), 100vh);
+    aspect-ratio:16/9;
+    display:grid; place-items:center;
+    overflow:hidden;
+    --deep:#080a2d;
+    --night:0;
+    background-color:#f5ecd9;
+    background-color:color-mix(in oklab, #f5ecd9 calc((1 - var(--night)) * 100%), var(--deep));
+  }
+  .widget{
+    position:relative;
+    width:60%;
+    height:64.886%;
+    aspect-ratio:1.6439;
+    touch-action:none;
+    user-select:none;
+    -webkit-user-select:none;
+    will-change:transform;
+  }
+  .widget canvas{
+    position:absolute; inset:0; width:100%; height:100%;
+    display:block; touch-action:none; pointer-events:none;
+    image-rendering:pixelated;
+  }
+  .widget button{
+    position:absolute;
+    left:7.37%; top:12.12%;
+    width:85.26%; height:75.76%;
+    margin:0; padding:0; border:0;
+    border-radius:999px;
+    background:transparent;
+    color:transparent;
+    font-size:0;
+    cursor:grab;
+    touch-action:none;
+    outline:none;
+    -webkit-appearance:none;
+    appearance:none;
+  }
+  .widget button:active{ cursor:grabbing; }
+  .widget button:focus-visible{
+    outline:2px solid color-mix(in oklab, #1b2146 70%, transparent);
+    outline-offset:7px;
+  }
+  .sr{
+    position:absolute; width:1px; height:1px; margin:-1px; padding:0;
+    overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%);
+    white-space:nowrap; border:0;
+  }
+  @media (prefers-reduced-motion: reduce){
+    .stage{ transition:none !important; }
+  }
+</style>
+</head>
+<body>
+<main class="stage" id="stage">
+  <div class="widget" id="widget">
+    <canvas id="view" aria-hidden="true"></canvas>
+    <button id="btn" type="button" role="switch" aria-checked="false" aria-label="专注模式"></button>
+    <span id="live" class="sr" role="status" aria-live="polite"></span>
+  </div>
+</main>
+<script>
+
+(() => {
+'use strict';
+
+/* ------------------------------------------------------------------ *
+ * 0. DOM & small math
+ * ------------------------------------------------------------------ */
+const stage  = document.getElementById('stage');
+const widget = document.getElementById('widget');
+let view     = document.getElementById('view');
+const btn    = document.getElementById('btn');
+const live   = document.getElementById('live');
+
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+const lerp  = (a,b,t) => a+(b-a)*t;
+const smooth= (a,b,x) => { const t=clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); };
+const mod   = (x,n) => ((x%n)+n)%n;
+const damp  = (cur,tgt,rate,dt) => cur + (tgt-cur)*(1-Math.exp(-rate*dt));
+
+const REDUCE_MQ = matchMedia('(prefers-reduced-motion: reduce)');
+let reduced = REDUCE_MQ.matches;
+
+/* ------------------------------------------------------------------ *
+ * 1. OKLab palette — 5 hues x 4 lightness, gamut mapped by chroma
+ * ------------------------------------------------------------------ */
+const srgbToLin = c => { c/=255; return c<=0.04045 ? c/12.92 : Math.pow((c+0.055)/1.055,2.4); };
+const linToSrgb = c => {
+  c = Math.max(0,Math.min(1,c));
+  return 255*(c<=0.0031308 ? 12.92*c : 1.055*Math.pow(c,1/2.4)-0.055);
+};
+function rgbToOklab(r,g,b){                 // linear rgb in, [L,a,b] out
+  const l = 0.4122214708*r + 0.5363325363*g + 0.0514459929*b;
+  const m = 0.2119034982*r + 0.6806995451*g + 0.1073969566*b;
+  const s = 0.0883024619*r + 0.2817188376*g + 0.6299787005*b;
+  const L = Math.cbrt(l), M = Math.cbrt(m), S = Math.cbrt(s);
+  return [ 0.2104542553*L + 0.7936177850*M - 0.0040720468*S,
+           1.9779984951*L - 2.4285922050*M + 0.4505937099*S,
+           0.0259040371*L + 0.7827717662*M - 0.8086757660*S ];
+}
+function oklabToLin(L,a,b){                 // [L,a,b] in, linear rgb out
+  const l_ = L + 0.3963377774*a + 0.2158037573*b;
+  const m_ = L - 0.1055613458*a - 0.0638541728*b;
+  const s_ = L - 0.0894841775*a - 1.2914855480*b;
+  const l = l_*l_*l_, m = m_*m_*m_, s = s_*s_*s_;
+  return [  4.0767416621*l - 3.3077115913*m + 0.2309699292*s,
+           -1.2684380046*l + 2.6097574011*m - 0.3413193965*s,
+           -0.0041960863*l - 0.7034186147*m + 1.7076147010*s ];
+}
+const inGamut = rgb => rgb[0]>=-0.0007 && rgb[0]<=1.0007 &&
+                       rgb[1]>=-0.0007 && rgb[1]<=1.0007 &&
+                       rgb[2]>=-0.0007 && rgb[2]<=1.0007;
+function gamutLab(L,a,b){                   // reduce chroma stepwise until it fits
+  L = clamp(L,0,0.995);
+  const at = s => oklabToLin(L,a*s,b*s);
+  if (inGamut(at(1))) return at(1);
+  let lo=0, hi=1;
+  for (let i=0;i<22;i++){ const m=(lo+hi)/2; if (inGamut(at(m))) lo=m; else hi=m; }
+  return at(lo);
+}
+function hexToLin(hex){
+  return [parseInt(hex.slice(1,3),16),parseInt(hex.slice(3,5),16),parseInt(hex.slice(5,7),16)]
+    .map(srgbToLin);
+}
+const PALETTE = (() => {
+  const bases = [
+    ['#f5ecd9',[.76,.85,.93,.985]],
+    ['#8c9a62',[.40,.52,.64,.76]],
+    ['#1b2146',[.17,.25,.33,.44]],
+    ['#7f97b3',[.50,.62,.74,.86]],
+    ['#efa02c',[.50,.66,.80,.92]],
+  ];
+  const pal = [];
+  for (const [hex, levels] of bases){
+    const lab = rgbToOklab(...hexToLin(hex));
+    for (const L of levels){
+      const lin = gamutLab(L,lab[1],lab[2]);
+      const s = lin.map(linToSrgb);
+      const rgb = [Math.round(s[0]),Math.round(s[1]),Math.round(s[2])];
+      pal.push({ lab:[L,lab[1],lab[2]], rgb, hex:'#'+rgb.map(v=>v.toString(16).padStart(2,'0')).join('') });
+    }
+  }
+  return pal;
+})();
+const ACCENT_LAB = PALETTE[18].lab; // accent @ L .80, hue reference for lamp light
+const DEEP_HEX = PALETTE[8].hex;    // darkest navy of the palette
+const STAGE_CREAM = rgbToOklab(...hexToLin('#f5ecd9'));
+const STAGE_DEEP  = rgbToOklab(...hexToLin(DEEP_HEX));
+stage.style.setProperty('--deep', DEEP_HEX);
+stage.style.setProperty('--night', '0');
+
+// the CSS color-mix is the progressive enhancement; paint the same oklab
+// mix from JS so the stage always darkens with the room, even in engines
+// without color-mix()
+function paintStage(night){
+  const lin = oklabToLin(
+    lerp(STAGE_CREAM[0], STAGE_DEEP[0], night),
+    lerp(STAGE_CREAM[1], STAGE_DEEP[1], night),
+    lerp(STAGE_CREAM[2], STAGE_DEEP[2], night)
+  );
+  const rgb = lin.map(linToSrgb).map(v => Math.round(clamp(v,0,255)));
+  stage.style.backgroundColor = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+}
+
+/* time-of-day columns: 0 day · 1 dusk · 2 evening · 3 night */
+function timeLab(lab, col){
+  const [L,a,b] = lab;
+  if (col===0) return [L,a,b];
+  if (col===1) return [L*0.935+0.018, a*1.14+0.004, b*1.10+0.012];
+  if (col===2) return [L*0.700+0.016, a*0.90-0.002, b*0.72-0.008];
+  return [L*0.480+0.020, a*0.64-0.006, b*0.52-0.030];
+}
+function lampLab(labT, dayLab){
+  const [L,a,b] = labT, [Ld] = dayLab;
+  const C = Math.hypot(a,b), Ca = Math.hypot(ACCENT_LAB[1],ACCENT_LAB[2]) || 1;
+  const aa = ACCENT_LAB[1]/Ca*C, bb = ACCENT_LAB[2]/Ca*C;
+  return [ clamp(lerp(L, Ld, 0.55)*1.03 + 0.015, 0.1, 0.94),
+           lerp(a, aa*1.05 + 0.006, 0.72),
+           lerp(b, bb*1.05 + 0.010, 0.72) ];
+}
+const VAR_N=0, VAR_SH=1, VAR_LP=2, VAR_DL=3;
+const LUT = (() => {
+  const pack = rgb => (255<<24) | (rgb[2]<<16) | (rgb[1]<<8) | rgb[0];
+  const srgb = lin => [linToSrgb(lin[0]),linToSrgb(lin[1]),linToSrgb(lin[2])];
+  const out = [];
+  for (let col=0; col<4; col++){
+    const perVar = [[],[],[],[]];
+    for (let ci=0; ci<20; ci++){
+      const dayLab = PALETTE[ci].lab;
+      const labT = timeLab(dayLab, col);
+      const variants = [
+        labT,
+        [labT[0]-0.068, labT[1]*0.92, labT[2]*0.92],
+        lampLab(labT, dayLab),
+        [labT[0]+0.060, labT[1]*1.03, labT[2]*1.03],
+      ];
+      for (let v=0; v<4; v++){
+        const rgb = srgb(gamutLab(variants[v][0],variants[v][1],variants[v][2]));
+        perVar[v][ci] = pack(rgb.map(v2=>Math.round(clamp(v2,0,255))));
+      }
+    }
+    out.push(perVar);
+  }
+  return out; // out[col][variant][colorIndex] -> ABGR uint32
+})();
+const LUT_DAY = LUT[0];
+
+/* material ids = palette indices */
+const BG0=0,BG1=1,BG2=2,BG3=3, SF0=4,SF1=5,SF2=6,SF3=7,
+      FG0=8,FG1=9,FG2=10,FG3=11, MU0=12,MU1=13,MU2=14,MU3=15,
+      AC0=16,AC1=17,AC2=18,AC3=19;
+const DAY=128;
+const N0=0, SH=1, LP=2, DL=3;
+const C = (m, v=0, day=false) => (m | (v<<5) | (day?DAY:0));
+
+/* key times -> column, dithered between neighbours */
+const KEYTIMES = [[0,3],[1.5,3],[2,3],[2.5,2],[3,1],[3.6,0],[10,0],[15,0],[17,1],[18,1],[19,2],[20.3,3],[24,3]];
+function timeColumn(h){
+  h = mod(h,24);
+  for (let i=0;i<KEYTIMES.length-1;i++){
+    const [t0,c0] = KEYTIMES[i], [t1,c1] = KEYTIMES[i+1];
+    if (h>=t0 && h<=t1) return c0 + (c1-c0) * ((h-t0)/Math.max(1e-6,t1-t0));
+  }
+  return 3;
+}
+const BAYER = [0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5].map(v=>(v+0.5)/16);
+
+/* ------------------------------------------------------------------ *
+ * 2. Geometry
+ * ------------------------------------------------------------------ */
+const G = { w:0,h:0,dpr:1, capH:0,capW:0, cx:0,cy:0, shell:0,
+            winH:0,winW:0, winCX:0,winCY:0, lensR:0, lensMin:0,lensMax:0, k:1,
+            bufW:0, bufH:0 };
+function layout(){
+  const r = widget.getBoundingClientRect();
+  const w = r.width, h = r.height;
+  if (w<2 || h<2) return false;
+  G.w = w; G.h = h;
+  G.dpr = Math.min(window.devicePixelRatio || 1, 3);
+  G.capH = h/1.32;
+  G.capW = G.capH*1.85;
+  G.cx = w/2; G.cy = h/2;
+  G.shell = G.capH*0.046;
+  G.winH = G.capH - 2*G.shell;
+  G.winW = G.capW - 2*G.shell;
+  G.winCX = w/2; G.winCY = h/2;
+  G.lensR = G.winH/2 - G.capH*0.032;
+  G.lensMin = G.winCX - (G.winW/2 - G.lensR);
+  G.lensMax = G.winCX + (G.winW/2 - G.lensR);
+  let k = Math.max(1, Math.floor(G.winH/112));
+  if ((k+1)*112 - G.winH <= 0.12*G.winH) k++;
+  G.k = k;
+  G.bufW = Math.max(1, Math.round(w*G.dpr));
+  G.bufH = Math.max(1, Math.round(h*G.dpr));
+  return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. Interaction state
+ * ------------------------------------------------------------------ */
+const state = {
+  pos: 0,
+  target: 0,
+  vel: 0,
+  drag: false,
+  dragX: 0,
+  startPos: 0,
+  startPointer: 0,
+  moved: 0,
+  press: 0,
+  lift: 0,
+  stretch: 0,
+  stretchV: 0,
+  bounce: 0,
+  mode: 'fwd',
+  leaveH: 23.4,
+  dwell: 0,
+  atEnd: false,
+  on: false,
+  lastPointerT: 0,
+  fastT: 0,
+  surprise: 0,
+  jumpT: 0,
+  blinkT: 2.5,
+  blink: 0,
+  phoneLit: 0,
+  phoneVibe: 0,
+  glance: 0,
+  msgCount: 3,
+  badge: 0,
+  backlog: 0,
+  bubbles: [],
+  bubbleTimer: 1.2,
+  burst: 0,
+  burstTimer: 0,
+  burstDone: false,
+  burstArmed: false,
+  kettleSteam: 0,
+  worldT: 0,
+  time: 0,
+  drawT: 0,
+  dirty: true,
+  idle: 0,
+};
+state.target = 0;
+state.on = false;
+
+/* ------------------------------------------------------------------ *
+ * 4. Clock (two roads)
+ * ------------------------------------------------------------------ */
+function rawHour(){
+  const s = state;
+  if (s.mode === 'fwd'){
+    if (s.pos >= 0.9995) return 21.5 + 1.9*Math.min(1, s.dwell/26);
+    return 12 + 9.5*s.pos;
+  }
+  return s.leaveH + (36 - s.leaveH)*(1 - s.pos);
+}
+function nightOf(h24){
+  return clamp(1 - smooth(1.5,3.6,h24) + smooth(17.4,20.2,h24), 0, 1);
+}
+
+/* ------------------------------------------------------------------ *
+ * 5. Story state from clock
+ * ------------------------------------------------------------------ */
+const S = {
+  h:12, h24:12, t:0, night:0, open:1, blinds:0, lamp:0, lampFlick:0,
+  hp:0, code:0, codeLine:0, typing:0, typeRate:8, lean:0, steam:0,
+  sit:1, walkX:96, walk:0, stand:0, face:1, stretch:0, drink:0,
+  screenChat:1, phoneLit:0, cupOnDesk:1, cupOnShelf:0, carry:0,
+  kettle:0, rimL:0, chatRows:3, sun:0, dust:1,
+};
+function updateStory(dt){
+  const h = rawHour();
+  const h24 = h>=24 ? h-24 : h;
+  const night = nightOf(h24);
+  S.h = h; S.h24 = h24; S.night = night;
+  S.time = state.time;
+  if (h < 24){
+    /* ---- the rightward road: 12:00 -> midnight ---- */
+    S.open    = 1 - smooth(15.2,15.9,h);
+    S.blinds  = smooth(16.0,19.2,h);
+    S.hp      = smooth(14.0,14.75,h);
+    S.code    = smooth(14.55,14.8,h);
+    S.codeLine= clamp(Math.floor((h-15.4)*5.2),0,30);
+    S.typing  = h>=15.4 ? 1 : 0;
+    S.typeRate= h>=21.5 ? 14 : 8;
+    S.lean    = smooth(21.3,21.65,h);
+    S.steam   = 1 - smooth(19.5,22.6,h);
+    S.screenChat = 1-S.code;
+    S.sit=1; S.stand=0; S.walk=0; S.walkX=96; S.face=1;
+    S.stretch=0; S.drink=0; S.carry=0;
+    S.cupOnDesk=1; S.cupOnShelf=0;
+    S.kettle=0;
+    if (h < 18.3){ state.lampArmed = false; state.lampFlash = 0; }
+    if (h >= 18.4 && !state.lampArmed){ state.lampArmed = true; state.lampFlash = 0.52; }
+    if (state.lampFlash > 0){
+      state.lampFlash = Math.max(0, state.lampFlash - dt);
+      S.lamp = (Math.sin((0.52-state.lampFlash)*62) > -0.15) ? 1 : 0.06;
+      if (state.lampFlash === 0) S.lamp = 1;
+    } else {
+      S.lamp = h >= 18.4 ? 1 : 0;
+    }
+    S.rimL = S.screenChat ? (night>0.5?1:0) : (night>0.5?1:0);
+    S.sun = (1-S.blinds*0.95) * (1-night) * (h>5 && h<17.6 ? 1 : 0);
+  } else {
+    /* ---- the road back: midnight -> noon ---- */
+    const t = h-24;
+    S.t = t;
+    S.open   = smooth(7.0,7.7,t);
+    S.blinds = 1 - smooth(1.4,3.4,t);
+    S.lamp   = 1 - smooth(1.55,1.85,t);
+    S.hp     = 1 - smooth(0.45,0.85,t);
+    S.code   = t<7.7 ? 1 : 0;
+    S.codeLine = 30;
+    S.typing = 0;
+    S.typeRate = 8;
+    S.lean   = 1 - smooth(0.0,1.1,t);
+    S.steam  = 0;
+    S.stretch = t<1.4 ? Math.sin(clamp(t/1.3,0,1)*Math.PI) : 0;
+    S.screenChat = t>=7.7 ? 1 : 0;
+    S.kettle = (t>4.55 && t<6.75) ? 1 : 0;
+    // walk to the shelf, wait, come back
+    let sit=1, walk=0, x=96, face=1, stand=0;
+    if (t>=3.8 && t<4.75){
+      const p = (t-3.8)/0.95;
+      x = 96 + (166-96)*smooth(0,1,p);
+      walk=1; sit=0; stand=1; face=1;
+    } else if (t>=4.75 && t<6.6){
+      sit=0; stand=1; x=166; walk=0; face=1;
+    } else if (t>=6.6 && t<7.35){
+      const p=(t-6.6)/0.75;
+      x = 166 + (96-166)*smooth(0,1,p);
+      walk=1; sit=0; stand=1; face=-1;
+    }
+    S.sit=sit; S.walk=walk; S.walkX=x; S.face=face; S.stand=stand;
+    S.carry = (t>=6.6 && t<7.35) ? 1 : 0;
+    S.cupOnShelf = (t>=4.75 && t<6.6) ? 1 : 0;
+    S.cupOnDesk = (t<4.75 || t>=7.35) ? 1 : 0;
+    S.kettle = (t>4.55 && t<6.75) ? 1 : 0;
+    // occasional sip after sitting back down
+    if (t>=7.35){
+      const c = mod(state.time - 0.0, 5.6);
+      S.drink = (c>4.4 && c<5.1) ? Math.sin((c-4.4)/0.7*Math.PI) : 0;
+      S.steam = 1;
+    } else S.drink = 0;
+    S.rimL = night>0.5 && t<1.7 ? 1 : 0;
+    S.sun = (1-S.blinds*0.95) * (1-night);
+  }
+  // real-time decorations
+  S.phoneLit = state.phoneLit;
+  S.chatRows = Math.min(5, 2 + (state.msgCount%5));
+  S.sun *= 1;
+  stage.style.setProperty('--night', night.toFixed(4));
+  paintStage(night);
+  state.hour = h;
+  state.h24 = h24;
+}
+
+/* ------------------------------------------------------------------ *
+ * 6. Bubbles / messages
+ * ------------------------------------------------------------------ */
+function addChat(){ state.msgCount++; }
+function popBubble(b){
+  state.phoneLit = 1;
+  state.phoneVibe = 1;
+  state.glance = 1.0;
+  state.badge = Math.min(9, state.badge+1);
+  addChat();
+  if (b) b.dead = true;
+}
+function spawnBubble(near, fromWindow){
+  const x0 = 26 + Math.random()*32;
+  const y0 = 25 + Math.random()*25;
+  const b = {
+    x0, y0, x:x0, y:y0,
+    t:0, dur: 1.15 + Math.random()*0.35,
+    scale:0.1, phase:'enter', bonk:0, dead:false,
+    hue: Math.random(),
+  };
+  state.bubbles.push(b);
+}
+function updateBubbles(dt){
+  const s = state;
+  s.phoneLit = Math.max(0, s.phoneLit - dt*0.9);
+  s.phoneVibe = Math.max(0, s.phoneVibe - dt*4.5);
+  s.glance = Math.max(0, s.glance - dt*0.5);
+  s.surprise = Math.max(0, s.surprise - dt);
+  s.jumpT = Math.max(0, s.jumpT - dt);
+  s.blinkT -= dt;
+  if (s.blinkT <= 0){ s.blink = 1; s.blinkT = 2.2 + Math.random()*3.4; }
+  s.blink = Math.max(0, s.blink - dt*7);
+
+  // spawn messages while the distraction phase is on
+  const h = S.h;
+  const canSpawn = (h>=12 && h<18.7) && !S.lean;
+  const closed = S.open < 0.5;
+  s.bubbleTimer -= dt;
+  if (!reduced && canSpawn && s.bubbleTimer <= 0 && s.bubbles.length < 6){
+    spawnBubble();
+    s.bubbleTimer = closed ? (2.6 + Math.random()*1.8) : (1.5 + Math.random()*1.1);
+  }
+  // the flood on the way back
+  if (S.h >= 24 && S.t >= 7.7){
+    if (!s.burstArmed){
+      s.burstArmed = true;
+      s.burst = Math.max(4, s.backlog + 3);
+      s.burstTimer = 0.05;
+      s.backlog = 0;
+      addChat(); S.screenChat = 1;
+    }
+    if (s.burst > 0){
+      s.burstTimer -= dt;
+      if (s.burstTimer <= 0){
+        s.burst--; s.burstTimer = 0.14;
+        spawnBubble();
+      }
+    }
+  } else if (!(S.h>=24 && S.t<7.7)){
+    s.burstArmed = false;
+  }
+
+  for (const b of s.bubbles){
+    if (b.dead) continue;
+    if (b.phase === 'bonk'){
+      b.bonk += dt;
+      if (b.bonk > 1.15){ b.dead = true; s.backlog++; }
+      continue;
+    }
+    b.t += dt;
+    const p = clamp(b.t/b.dur,0,1);
+    // short hop: grow first, then arc to the phone
+    const grow = smooth(0,0.35,p);
+    b.scale = 0.12 + 0.88*grow;
+    if (!closed && b.phase==='enter' && p>0.06) b.phase='fly';
+    if (closed && p>0.10 && p<0.55){
+      b.phase='bonk'; b.bonk=0;
+      b.x = b.x0 + 7; b.y = b.y0 + 5;
+      continue;
+    }
+    const midX = 62, midY = 20;
+    const ex = 74, ey = 66;
+    const m = smooth(0,1,p);
+    b.x = lerp(b.x0, ex, m) + Math.sin(m*Math.PI)*8;
+    b.y = lerp(b.y0, ey, m) - Math.sin(m*Math.PI)*14;
+    if (p>=1){ popBubble(b); }
+  }
+  if (s.bubbles.length && s.bubbles.some(b=>b.dead))
+    s.bubbles = s.bubbles.filter(b=>!b.dead);
+}
+
+function fastDragCheck(dx, dt){
+  if (reduced) return;
+  const v = Math.abs(dx)/Math.max(0.001,dt);
+  if (v > 3.4 && state.fastT <= 0){
+    state.fastT = 1.5;
+    if (S.sit && S.stand === 0){
+      state.surprise = 1.15;
+      state.stretchV += 0;
+    } else {
+      state.jumpT = 0.55;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 7. Pointer / keyboard / switch semantics
+ * ------------------------------------------------------------------ */
+let lastKeyToggle = -1e9;
+function announce(){
+  let msg;
+  const p = state.drag ? state.pos : state.target;
+  if (state.mode === 'ret'){
+    msg = (S.h >= 24 && S.h24 < 12) ? '休息' : '结束专注';
+  } else if (p >= 0.985){
+    msg = '专注';
+  } else if (p > 0.24){
+    msg = '进入专注';
+  } else {
+    msg = '可以打扰';
+  }
+  if (live.textContent !== msg) live.textContent = msg;
+}
+function setOn(v, fire){
+  if (state.on === v) return;
+  state.on = v;
+  btn.setAttribute('aria-checked', v?'true':'false');
+  if (fire){
+    btn.dispatchEvent(new CustomEvent('change',{bubbles:true,detail:{on:v}}));
+  }
+}
+function commitTarget(t, fireChange){
+  state.target = clamp(t,0,1);
+  if (fireChange) setOn(state.target >= 0.5, true);
+}
+function pointerPos(e){
+  const r = widget.getBoundingClientRect();
+  return clamp((e.clientX - r.left - G.lensMin) / (G.lensMax - G.lensMin), 0, 1);
+}
+btn.addEventListener('pointerdown', e => {
+  if (e.button !== undefined && e.button !== 0) return;
+  e.preventDefault();
+  try { btn.setPointerCapture(e.pointerId); } catch(_){}
+  const r = widget.getBoundingClientRect();
+  const knobX = r.left + G.lensMin + state.pos*(G.lensMax - G.lensMin);
+  state.rect = r;
+  state.drag = true;
+  state.dragStarted = false;
+  state.moved = 0;
+  state.lastX = state.pos;
+  state.startPos = state.pos;
+  state.startPointer = e.clientX;
+  state.grabOff = Math.abs(e.clientX - knobX) < G.lensR*1.05 ? (e.clientX - knobX) : 0;
+  state.dragTarget = state.pos;
+  state.lastPX = e.clientX;
+  state.lastPT = performance.now();
+  state.pressT = performance.now();
+  btn.focus({preventScroll:true});
+  kick();
+});
+btn.addEventListener('pointermove', e => {
+  if (!state.drag) return;
+  const now = performance.now();
+  const r = state.rect || widget.getBoundingClientRect();
+  const travel = Math.max(1,(G.lensMax-G.lensMin));
+  const dx = e.clientX - state.startPointer;
+  const step = e.clientX - (state.lastPX!==undefined ? state.lastPX : e.clientX);
+  const mdt = clamp((now - (state.lastPT!==undefined ? state.lastPT : now-16))/1000, 0.004, 0.10);
+  state.lastPX = e.clientX;
+  state.lastPT = now;
+  state.moved = Math.max(state.moved, Math.abs(dx));
+  if (!state.dragStarted && Math.abs(dx) > 3) state.dragStarted = true;
+  if (state.dragStarted){
+    const tx = clamp((e.clientX - state.grabOff - r.left - G.lensMin)/travel, 0, 1);
+    state.dragTarget = tx;
+    fastDragCheck(step/travel, mdt);
+  }
+});
+btn.addEventListener('pointerup', e => {
+  if (!state.drag) return;
+  state.drag = false;
+  try { btn.releasePointerCapture(e.pointerId); } catch(_){}
+  if (!state.dragStarted || state.moved < 6){
+    commitTarget(state.pos>=0.5?0:1, true);
+    announce();
+  } else {
+    const v = clamp(state.vel,-3,3);
+    commitTarget((state.pos + v*0.09 >= 0.5) ? 1 : 0, true);
+    if (G.lensMax-G.lensMin>0) announce();
+  }
+  state.dragStarted = false;
+  kick();
+});
+btn.addEventListener('pointercancel', () => { state.drag = false; });
+btn.addEventListener('keydown', e => {
+  const k = e.key;
+  if (k==='ArrowRight' || k==='ArrowLeft'){
+    e.preventDefault();
+    const dir = k==='ArrowRight'?1:-1;
+    let t = clamp(state.target + dir*0.04,0,1);
+    if (dir<0 && state.mode==='fwd' && state.pos>0.99){ startReturn(); }
+    if (state.mode==='ret' && t>=0.999){ /* stay on the return road */ }
+    commitTarget(t, true);
+    announce();
+    kick();
+  } else if (k==='Enter' || k===' ' || k==='Spacebar'){
+    e.preventDefault();
+    lastKeyToggle = performance.now();
+    commitTarget(state.target>=0.5?0:1, true);
+    announce();
+    kick();
+  } else if (k==='Home'){ e.preventDefault(); commitTarget(0,true); announce(); kick(); }
+  else if (k==='End'){ e.preventDefault(); commitTarget(1,true); announce(); kick(); }
+});
+btn.addEventListener('click', e => {
+  // assistive tech fires click without pointer events (detail 0);
+  // ignore the synthetic click a key press may still produce
+  if (e.detail === 0 && performance.now() - lastKeyToggle > 500){
+    commitTarget(state.target>=0.5?0:1, true);
+    announce(); kick();
+  }
+});
+function startReturn(){
+  state.mode = 'ret';
+  state.leaveH = clamp(rawHour(),21.5,23.4);
+  state.dwell = 0;
+}
+function kick(){ state.dirty = true; state.idle = 0; startLoop(); }
+
+/* ------------------------------------------------------------------ *
+ * 8. Springs & motion
+ * ------------------------------------------------------------------ */
+function stepMotion(dt){
+  const s = state;
+  const prev = s.pos;
+  if (s.drag){
+    const tgt = s.dragTarget!==undefined ? s.dragTarget : s.pos;
+    s.pos = damp(s.pos, tgt, 34, dt);
+    s.vel = (s.pos - prev)/Math.max(1e-4,dt);
+  } else {
+    const w = reduced ? 16 : 9.5;
+    const acc = w*w*(s.target - s.pos) - 2*w*s.vel;
+    s.vel += acc*dt;
+    s.pos += s.vel*dt;
+    if (Math.abs(s.target-s.pos)<0.0005 && Math.abs(s.vel)<0.0035){ s.pos=s.target; s.vel=0; }
+  }
+  s.pos = clamp(s.pos, -0.02, 1.02);
+  if (!s.drag && s.vel !== 0) s.vel = clamp(s.vel,-4,4);
+
+  // mode transitions
+  if (s.mode==='fwd'){
+    if (s.pos >= 0.9975){
+      s.atEnd = true;
+      if (!s.drag) s.dwell = Math.min(26, s.dwell + dt);
+    }
+    if (s.atEnd && s.pos < 0.994){
+      startReturn();
+      s.atEnd = false;
+    }
+  } else {
+    if (s.pos <= 0.0022){
+      // arrived back on the left: the story has looped to noon
+      s.mode='fwd'; s.dwell=0; s.leaveH=23.4; s.pos=Math.max(0,s.pos);
+    }
+  }
+
+  // press lift
+  const pT = (s.drag || s.press>0) ? 1 : 0;
+  s.lift = damp(s.lift, pT, 14, dt);
+  if (!s.drag) s.press = Math.max(0, s.press-dt*8);
+
+  // lens liquid stretch (under-damped)
+  const targetS = reduced ? 0 : clamp(Math.min(1.2, Math.abs(s.vel)*0.42),0,1.2);
+  const kS = reduced?160:170, cS = reduced?22:11;
+  const aS = kS*(targetS-s.stretch) - cS*s.stretchV;
+  s.stretchV += aS*dt;
+  s.stretch += s.stretchV*dt;
+  s.stretch = clamp(s.stretch,-0.4,1.4);
+  // endpoint bounce (latched, once per arrival)
+  if (!s.drag){
+    if ((s.pos<=0.0015 || s.pos>=0.9985) && Math.abs(s.vel)>0.25 && !s.endKick){
+      s.stretchV += 2.1;
+      s.endKick = true;
+    }
+    if (s.pos>0.06 && s.pos<0.94) s.endKick = false;
+  }
+  s.fastT = Math.max(0, s.fastT - dt);
+  s.time += dt;
+}
+
+/* ------------------------------------------------------------------ *
+ * 9. Ready flag
+ * ------------------------------------------------------------------ */
+updateStory(0);
+
+
+/* ------------------------------------------------------------------ *
+ * 10. Pixel world — 192x112 core + 14px apron on every side
+ * ------------------------------------------------------------------ */
+const MW = 14, MCW = 192, MCH = 112, WW = MCW + MW*2, WH = MCH + MW*2;
+const wbuf = new Uint8Array(WW*WH);
+const wcanvas = document.createElement('canvas');
+wcanvas.width = WW; wcanvas.height = WH;
+const wctx = wcanvas.getContext('2d', {willReadFrequently:true});
+const wimg = wctx.createImageData(WW, WH);
+const w32 = new Uint32Array(wimg.data.buffer);
+
+function setp(x,y,code){
+  x = Math.round(x)+MW; y = Math.round(y)+MW;
+  if (x<0||x>=WW||y<0||y>=WH) return;
+  wbuf[y*WW+x] = code;
+}
+function rect(x,y,w,h,code){
+  x += MW; y += MW;
+  const x0=Math.max(0,x), y0=Math.max(0,y);
+  const x1=Math.min(WW,x+w), y1=Math.min(WH,y+h);
+  for (let j=y0;j<y1;j++){
+    const row=j*WW;
+    for (let i=x0;i<x1;i++) wbuf[row+i]=code;
+  }
+}
+function ell(cx,cy,rx,ry,code){
+  for (let y=Math.ceil(cy-ry); y<=Math.floor(cy+ry); y++){
+    const dy=(y-cy)/ry;
+    for (let x=Math.ceil(cx-rx); x<=Math.floor(cx+rx); x++){
+      const dx=(x-cx)/rx;
+      if (dx*dx+dy*dy<=1) setp(x,y,code);
+    }
+  }
+}
+function line(x0,y0,x1,y1,code){
+  x0=Math.round(x0); y0=Math.round(y0); x1=Math.round(x1); y1=Math.round(y1);
+  const dx=Math.abs(x1-x0), dy=-Math.abs(y1-y0), sx=x0<x1?1:-1, sy=y0<y1?1:-1;
+  let err=dx+dy;
+  for(;;){
+    setp(x0,y0,code);
+    if (x0===x1 && y0===y1) break;
+    const e2=2*err;
+    if (e2>=dy){ err+=dy; x0+=sx; }
+    if (e2<=dx){ err+=dx; y0+=sy; }
+  }
+}
+function setVar(x,y,v){
+  x += MW; y += MW;
+  if (x<0||x>=WW||y<0||y>=WH) return;
+  const i=y*WW+x;
+  wbuf[i] = (wbuf[i] & ~(3<<5)) | (v<<5);
+}
+function texel(x,y){
+  x += MW; y += MW;
+  if (x<0||x>=WW||y<0||y>=WH) return 0;
+  return wbuf[y*WW+x];
+}
+const bayerAt = (x,y) => BAYER[(mod(y,4)*4 + mod(x,4))];
+
+/* ---- outside view, always daytime ---- */
+const outC = (m,v=0) => C(m,v,true);
+function outRect(x,y,w,h,code){
+  for (let j=y;j<y+h;j++){
+    if (j<20||j>62) continue;
+    for (let i=x;i<x+w;i++){
+      if (i<22||i>60) continue;
+      setp(i,j,code);
+    }
+  }
+}
+function drawOutside(){
+  const T = state.time;
+  // sky
+  for (let y=20;y<=62;y++){
+    for (let x=22;x<=60;x++){
+      let m=MU3;
+      if (y>42) m = MU2;
+      if (y>46) m = SF1;
+      if (y>52) m = SF2;
+      if (y>58) m = SF2;
+      setp(x,y,outC(m));
+    }
+  }
+  // sun warmth high in the sky
+  for (let y=20;y<31;y++) for (let x=22;x<=60;x++)
+    if (bayerAt(x,y) < (31-y)*0.035) setp(x,y,outC(MU3,DL));
+  // far ridge
+  for (let x=22;x<=60;x++){
+    const far = 40 + Math.round(2.4*Math.sin((x-16)*0.33) + 1.8*Math.sin((x-4)*0.11+1.7));
+    const near= 46 + Math.round(1.6*Math.sin((x-30)*0.45+0.6));
+    for (let y=far;y<=62;y++) setp(x,y,outC(MU2));
+    for (let y=near;y<=62;y++) setp(x,y,outC(SF1));
+    if (far<41) setp(x,far,outC(BG3));
+  }
+  // grass
+  for (let x=22;x<=60;x++){
+    const g=52+Math.round(1.2*Math.sin(x*0.7));
+    for (let y=g;y<=62;y++) setp(x,y,outC(y>58?SF2:SF3));
+  }
+  // distant house
+  outRect(37,46,14,2,outC(AC1));
+  for (let i=0;i<6;i++) outRect(37+i*2,45,3,1,outC(AC1));
+  outRect(38,48,12,7,outC(BG3));
+  outRect(39,49,3,2,outC(MU2,SH));
+  outRect(46,49,2,2,outC(MU2,SH));
+  outRect(44,51,2,4,outC(AC0));
+  // chimney
+  outRect(48,42,2,4,outC(AC0));
+  // two round trees
+  const trees=[27,54];
+  for (let i=0;i<2;i++){
+    const tx=trees[i], sway=Math.round(Math.sin(T*0.8+i*2.1)*0.4);
+    outRect(tx,50,1,5,outC(AC0));
+    ell(tx+sway,46,4,5,outC(SF2));
+    ell(tx+sway-1,44,2,2,outC(SF3));
+    outRect(tx+sway-3,49,2,1,outC(SF1));
+  }
+  // drifting clouds
+  for (let i=0;i<2;i++){
+    const cw=6+i*4;
+    const cx = 22 + Math.floor(mod(T*(1.5+i*0.6) + i*23, 46));
+    const cy = 24 + i*8;
+    outRect(cx,cy,cw,2,outC(BG3));
+    outRect(cx+2,cy-1,cw-4,1,outC(BG3));
+    outRect(cx+1,cy+2,cw-2,1,outC(MU2,SH));
+  }
+  // an occasional bird
+  const bird = mod(T*0.055, 1);
+  if (bird < 0.45){
+    const bx = 22 + Math.floor(bird*150) % 34;
+    const by = 28 + Math.round(Math.sin(T*3.1)*1);
+    outRect(bx,by,1,1,outC(FG1));
+    outRect(bx+2,by,1,1,outC(FG1));
+    outRect(bx+1,by-1,1,1,outC(FG1));
+  }
+}
+
+function drawWindow(){
+  const S_=S;
+  // recess shadow on the wall
+  rect(17,15,48,53,C(BG1));
+  rect(18,16,46,51,C(BG1,SH));
+  // white frame
+  rect(19,17,45,49,C(BG3));
+  drawOutside();
+  // glass top inner shade
+  for (let y=20;y<25;y++)
+    for (let x=22;x<=60;x++) if (bayerAt(x,y) < (25-y)*0.14) setVar(x,y,SH);
+  // moving lower sash
+  const op = Math.round(clamp(S_.open,0,1)*19);
+  const sy = 38 - op, by = 61 - op;
+  rect(22,sy,39,2,C(BG3));
+  rect(22,sy+1,39,1,C(BG2));
+  rect(22,by-1,39,2,C(BG3));
+  rect(22,by-2,39,1,C(BG2));
+  rect(22,sy,2,by-sy,C(BG3));
+  rect(59,sy,2,by-sy,C(BG3));
+  // glass reflection: one long soft diagonal
+  for (let y=21;y<60;y++){
+    const x = 24 + Math.round((y-20)*0.55);
+    if (x>=23&&x<=58 && bayerAt(x,y)<0.5) setp(x,y,outC(BG3));
+  }
+  // frame inner shadow on right/bottom
+  rect(61,20,1,43,C(BG2));
+  rect(22,63,39,1,C(BG2));
+  rect(19,17,45,1,C(BG3,DL));
+  // sill
+  rect(15,66,52,2,C(BG3));
+  rect(15,66,52,1,C(BG3,DL));
+  rect(15,68,52,1,C(BG1));
+  rect(15,68,52,1,C(BG1,SH));
+  // blinds descend from the top
+  const bh = Math.round(clamp(S_.blinds,0,1)*42);
+  for (let i=0;i<bh;i++){
+    const y = 20+i;
+    if (i%3===2) rect(22,y,39,1,outC(BG3,DL));
+    else if (i%3===1) rect(22,y,39,1,C(BG1));
+    else rect(22,y,39,1,C(BG2));
+  }
+  if (bh>0 && bh<42) rect(22,20+bh,39,2,C(BG3));
+  if (bh>0) rect(59,20,1,bh,C(BG2,SH));
+  // small plant on the sill, swaying when the window is open
+  const sway = S_.open>0.1 ? Math.round(Math.sin(state.time*2.2)*1.4*S_.open) : 0;
+  rect(47,62,6,4,C(AC1));
+  rect(46,61,8,2,C(AC2));
+  rect(47,65,6,1,C(AC0));
+  rect(47,63,1,2,C(AC0));
+  const lx=50+sway;
+  line(lx,61,lx-2,57,C(SF1));
+  line(lx,61,lx+1,56,C(SF1));
+  ell(lx-2,56,2,1,C(SF2));
+  ell(lx+2,55,2,1,C(SF2));
+  ell(lx-1,54,2,1,C(SF3));
+  setp(lx-1,53,C(SF2));
+  setp(lx+3,57,C(SF2));
+  setp(lx-4,58,C(SF1));
+}
+
+/* ---- wall art ---- */
+function drawPicture(){
+  rect(76,24,17,13,C(AC1));
+  rect(77,25,15,11,C(AC0));
+  for (let y=26;y<35;y++) for (let x=78;x<91;x++) setp(x,y,outC(MU3));
+  for (let x=78;x<91;x++){
+    const h=30+Math.round(1.5*Math.sin(x*0.6));
+    for (let y=h;y<35;y++) setp(x,y,outC(SF2));
+  }
+  ell(86,29,1,1,outC(AC3));
+  rect(76,24,17,1,C(AC2));
+  setp(84,36,C(AC0));
+}
+
+/* ---- bookshelf ---- */
+function drawBooks(x0,x1,yBase,seed){
+  let x=x0;
+  let i=0;
+  while (x<x1-1){
+    const bw = 1 + ((seed+i*7)%3);
+    const bh = 5 + ((seed*3+i*5)%7);
+    const ci = [SF2,AC1,MU2,FG3,BG1,SF3,AC2,SF1][(seed+i*3)%8];
+    const top = yBase-bh;
+    rect(x,top,Math.min(bw,x1-x),bh,C(ci));
+    rect(x,top,Math.min(bw,x1-x),1,C(ci,DL));
+    if (bw>1) rect(x+bw-1,top,1,bh,C(ci,SH));
+    x += bw + ((seed*5+i*3)%2===0?0:1);
+    i++;
+    if (i>24) break;
+  }
+}
+function drawShelf(){
+  // carcass
+  rect(162,32,29,64,C(AC1));
+  rect(164,34,25,59,C(AC0));
+  rect(162,32,29,2,C(AC2));
+  rect(162,32,2,64,C(AC1));
+  rect(189,32,2,64,C(AC0));
+  rect(162,94,29,2,C(AC0));
+  // compartments / boards
+  rect(164,34,25,59,C(AC0,SH));
+  for (const by of [48,64,80]){
+    rect(164,by,25,2,C(AC1));
+    rect(164,by,25,1,C(AC2));
+  }
+  rect(164,91,25,2,C(AC1));
+  // shelf 1 books
+  drawBooks(165,187,47,3);
+  // shelf 2 : kettle + bean jar  (49..63)
+  // kettle
+  rect(169,55,7,8,C(MU1));
+  rect(169,54,7,1,C(MU2));
+  rect(170,53,5,1,C(MU1));
+  rect(175,52,1,3,C(MU1));
+  rect(176,51,1,1,C(MU1));
+  rect(168,56,1,5,C(MU2));
+  rect(169,55,7,1,C(MU3,DL));
+  setp(166,56,C(MU1)); setp(167,55,C(MU1)); setp(167,56,C(MU1));
+  // bean jar
+  rect(180,54,6,9,C(BG2));
+  rect(181,55,4,7,C(MU2));
+  rect(181,58,4,4,C(AC0));
+  for (let i=0;i<4;i++) setp(181+i,59+((i*3)%4),C(AC1));
+  rect(180,53,6,1,C(AC3));
+  rect(181,52,4,1,C(AC2));
+  // the cup waits on this shelf while the kettle boils
+  if (S.cupOnShelf){
+    rect(177,58,3,3,C(BG3));
+    rect(177,58,3,1,C(BG3,DL));
+    rect(176,59,1,1,C(BG3));
+    if (S.kettle>0.02) drawSteam(178,57,0.5,0.4);
+  }
+  // shelf 3 books + basket
+  drawBooks(165,177,79,7);
+  rect(178,70,9,9,C(AC1));
+  rect(178,70,9,1,C(AC2));
+  rect(179,69,7,1,C(AC1));
+  for (let y=71;y<79;y+=2) rect(178,y,9,1,C(AC0));
+  rect(179,71,2,6,C(AC1));
+  rect(184,71,2,6,C(AC0));
+  // shelf 4 : horizontal stack
+  rect(166,88,7,3,C(MU2)); rect(166,87,7,1,C(MU3));
+  rect(174,90,8,2,C(AC1)); rect(174,89,8,1,C(AC2));
+  rect(184,87,2,5,C(SF2)); rect(186,86,2,6,C(SF1));
+  // plant on top
+  rect(170,27,8,5,C(AC1));
+  rect(170,27,8,1,C(AC2));
+  rect(171,25,6,2,C(AC0,SH));
+  line(174,27,172,20,C(SF1));
+  line(174,27,176,18,C(SF1));
+  line(174,26,169,22,C(SF1));
+  ell(172,19,2,1,C(SF2));
+  ell(177,17,2,2,C(SF2));
+  ell(169,21,2,1,C(SF3));
+  ell(175,16,1,1,C(SF3));
+  // trailing vine down the right
+  line(189,31,189,44,C(SF1));
+  line(189,35,187,37,C(SF1));
+  line(189,40,187,42,C(SF1));
+  ell(186,37,1,1,C(SF2));
+  ell(186,42,1,1,C(SF2));
+  ell(187,34,1,1,C(SF3));
+}
+
+/* ---- desk ---- */
+function drawScreen(){
+  const x=113,y=47,w=24,h=15;
+  if (S.screenChat > 0.5){
+    rect(x,y,w,h,outC(BG3));
+    rect(x,y,w,2,outC(MU2));
+    rect(x+1,y+1,2,1,outC(BG3));
+    rect(x+4,y+1,7,1,outC(MU3));
+    // incoming / outgoing bubbles, newest resting at the bottom
+    const rows = 4;
+    for (let i=0;i<rows;i++){
+      const yy = y+h-4 - (rows-1-i)*3 + 1;
+      const n = state.msgCount - (rows-1-i);
+      const incoming = (n%3!==2);
+      const bw = 7 + ((n*5+state.msgCount)%7);
+      if (incoming){
+        rect(x+1,yy,bw,2,outC(MU2));
+        rect(x+1,yy,bw,1,outC(MU3));
+      } else {
+        rect(x+w-1-bw,yy,bw,2,outC(AC2));
+        rect(x+w-1-bw,yy,bw,1,outC(AC3));
+      }
+    }
+    rect(x,y+h-2,w,2,outC(MU1));
+    rect(x+1,y+h-1,w-5,1,outC(BG3));
+  } else {
+    rect(x,y,w,h,C(FG0,0,true));
+    rect(x,y,w,1,C(FG1,0,true));
+    rect(x+1,y+1,w-2,1,C(FG2,0,true));
+    rect(x,y+2,w,1,C(FG0,0,true));
+    // sidebar
+    rect(x,y+2,3,h-2,C(FG1,0,true));
+    for (let i=0;i<4;i++) rect(x+1,y+4+i*3,1,1,C(MU0,0,true));
+    // code
+    const lines = Math.min(9, Math.floor(S.codeLine));
+    for (let i=0;i<lines;i++){
+      const yy = y+3+i*1.25|0;
+      const indent = 4 + ((i*5)%3);
+      const len = 5 + ((i*7+3)%9);
+      const col = [MU2,AC2,SF2,BG2,MU3][i%5];
+      rect(x+indent,yy,Math.min(len,w-indent-1),1,C(col,0,true));
+      if (i%3===0) rect(x+indent+1,yy,2,1,C(AC3,0,true));
+    }
+    // blinking cursor
+    if ((state.time*2.2)%1 < 0.55 && !reduced){
+      const cy = y+3+Math.min(9,Math.floor(S.codeLine))*1.25|0;
+      rect(x+7, Math.min(y+h-2,cy), 1,2, C(AC3,0,true));
+    } else if (reduced){
+      rect(x+7, y+ h-3, 1,2, C(AC3,0,true));
+    }
+  }
+}
+function drawDesk(){
+  // shadow of the desk on the wainscot
+  for (let y=73;y<96;y++){
+    for (let x=72;x<140;x++){
+      if (bayerAt(x,y) < 0.38) setVar(x,y,SH);
+    }
+  }
+  // desktop
+  rect(68,70,90,1,C(AC2));
+  rect(68,71,90,1,C(AC1));
+  rect(68,72,90,1,C(AC0));
+  rect(68,73,90,1,C(AC0,SH));
+  // left leg
+  rect(69,73,3,23,C(AC1));
+  rect(71,73,1,23,C(AC0));
+  rect(69,73,1,23,C(AC2,SH));
+  // drawer cabinet
+  rect(140,73,18,23,C(AC1));
+  rect(140,73,1,23,C(AC0));
+  rect(157,73,1,23,C(AC0));
+  for (let i=0;i<3;i++){
+    const yy=74+i*7;
+    rect(141,yy,16,6,C(AC1));
+    rect(141,yy,16,1,C(AC2));
+    rect(141,yy+5,16,1,C(AC0));
+    rect(147,yy+3,3,1,C(AC3));
+  }
+  // keyboard
+  rect(102,68,12,2,C(FG1));
+  for (let i=0;i<6;i++) setp(103+i*2,68,C(FG3));
+  // screen glow on desktop
+  for (let x=110;x<140;x++)
+    for (let y=68;y<70;y++)
+      if (bayerAt(x,y)<0.22) setVar(x,y,DL);
+
+  // monitor
+  rect(111,45,27,18,C(FG2));
+  rect(111,45,27,1,C(FG3));
+  rect(111,62,27,1,C(FG1));
+  rect(112,46,25,1,C(FG1));
+  drawScreen();
+  rect(123,63,3,6,C(FG2));
+  rect(118,69,12,1,C(FG1));
+
+  // desk lamp
+  rect(143,67,9,2,C(FG2));
+  rect(143,67,9,1,C(FG3));
+  rect(144,68,7,1,C(FG1));
+  rect(147,56,2,11,C(FG2));
+  rect(147,56,1,11,C(FG3));
+  line(147,57,144,53,C(FG2));
+  line(146,57,143,54,C(FG1));
+  // shade — when lit the shade is emissive, so it keeps its daylight color
+  const on = S.lamp>0.3;
+  for (let i=0;i<4;i++){
+    const y=52+i;
+    const x0=145-i, x1=149+i;
+    rect(x0,y,x1-x0+1,1, on?C(AC2,0,true):C(AC1));
+    if (i===0 && on) rect(x0,y,x1-x0+1,1,C(AC3,DL,true));
+  }
+  rect(143,55,10,1, on?C(AC3,DL,true):C(AC0));
+  if (on){
+    rect(146,55,4,1,C(AC3,DL,true));
+    // halo in the air + warm spill on nearby surfaces
+    for (let y=40;y<64;y++) for (let x=134;x<162;x++){
+      if (x>=111&&x<=139&&y>=44&&y<=64) continue;
+      const dx=(x-148)/12, dy=(y-53)/10;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if (d>1) continue;
+      if (bayerAt(x,y) < (1-d)*0.62) setVar(x,y,LP);
+    }
+    for (let y=56;y<70;y++) for (let x=136;x<160;x++){
+      if (x>=111&&x<=139&&y<=63) continue;
+      const dx=(x-148)/13, dy=(y-62)/9;
+      const a = S.lamp*Math.max(0,1-Math.sqrt(dx*dx+dy*dy))*0.85;
+      if (bayerAt(x,y)<a) setVar(x,y,LP);
+    }
+  }
+
+  // phone
+  const vib = state.phoneVibe>0.3 ? (Math.floor(state.time*40)%2?1:0) : 0;
+  const px0 = 71+vib, py0 = 66 - (vib?1:0);
+  rect(px0,py0,6,4,C(FG1));
+  rect(px0+1,py0+1,4,2, state.phoneLit>0.15?outC(BG3):C(FG2));
+  if (state.phoneLit>0.15){
+    rect(px0+2,py0+1,1,1,outC(AC2));
+    rect(px0+4,py0+1,1,1,outC(MU2));
+  }
+  if (state.badge>0){
+    rect(px0+5,py0-1,2,2,C(AC2));
+    setp(px0+5,py0-1,C(AC3,DL));
+  }
+  // cup
+  if (S.cupOnDesk){
+    rect(80,65,5,5,C(BG3));
+    rect(80,65,5,1,C(BG3,DL));
+    rect(81,64,3,1,C(AC0));
+    rect(85,66,1,3,C(BG3));
+    rect(86,67,1,1,C(BG3));
+    if (S.steam>0.05) drawSteam(82,63, S.steam, 0.2);
+  }
+  // headphones prop
+  if (S.hp<0.6){
+    rect(137,66,6,1,C(BG3));
+    rect(137,67,1,2,C(BG3));
+    rect(142,67,1,2,C(BG3));
+    rect(136,67,2,3,C(BG3));
+    rect(142,67,2,3,C(BG3));
+    rect(136,69,2,1,C(MU1));
+    rect(142,69,2,1,C(MU1));
+  }
+}
+
+/* ---- steam ---- */
+function drawSteam(x0,y0,amount,seed){
+  if (reduced || amount<=0.02) return;
+  for (let i=0;i<5;i++){
+    const ph = mod(state.time*0.55 + i*0.23 + seed, 1);
+    const yy = y0 - Math.round(ph*8);
+    const xx = x0 + Math.round(Math.sin((ph*3+i)*3.1 + seed*7)*1.6 - ph*1.5);
+    const a = (1-ph)*amount*1.2;
+    if (bayerAt(xx+i, yy) > a) continue;
+    setp(xx,yy,C(BG3,DL,true));
+  }
+}
+
+/* ---- chair & human ---- */
+function drawChair(){
+  // soft blue task chair — distinct from the black hair and the olive shirt
+  rect(85,62,23,19,C(MU0));
+  rect(87,60,19,2,C(MU0));
+  rect(89,59,15,1,C(MU1));
+  rect(86,63,1,17,C(MU1));
+  rect(88,60,17,1,C(MU1));
+  rect(106,63,2,18,C(FG3));
+  rect(86,80,21,1,C(FG3));
+  // seat
+  rect(86,81,20,3,C(MU0));
+  rect(86,81,20,1,C(MU1));
+  rect(86,84,20,1,C(FG3));
+  // gas lift
+  rect(95,84,2,8,C(MU1));
+  rect(95,84,1,8,C(MU2));
+  // star base
+  rect(87,92,18,2,C(MU0));
+  rect(87,92,18,1,C(MU1));
+  for (const wx of [86,94,102]) rect(wx,94,2,2,C(FG3));
+}
+function drawSitter(){
+  const hd = Math.round(S.glance>0.35 ? -1 : 0);
+  const up = (S.lean>0.5?-1:0) + (state.surprise>0? 2:0);
+  const hy = 47 - up;
+  const hx = 96 + hd;
+  const blink = state.blink>0.4;
+  // torso
+  rect(89,58,15,1,C(SF2));
+  rect(89,59,15,2,C(SF2));
+  rect(90,61,14,17,C(SF2));
+  rect(90,61,1,17,C(SF3));
+  rect(102,61,2,17,C(SF1));
+  rect(96,62,1,15,C(SF1));
+  // shoulders highlight
+  rect(90,59,6,1,C(SF3));
+  // neck
+  rect(95,55,3,3,C(AC3));
+  // head (9 px of black hair, back of the head), rounded into an oval
+  rect(hx-4,hy,9,9,C(FG0));
+  setp(hx-4,hy,C(BG2)); setp(hx+4,hy,C(BG2));
+  setp(hx-4,hy+8,C(BG2)); setp(hx+4,hy+8,C(BG2));
+  setp(hx-4,hy+7,C(BG1)); setp(hx+4,hy+7,C(BG1));
+  // hair sheen
+  rect(hx-3,hy+1,3,1,C(FG3));
+  setp(hx-3,hy+2,C(FG3));
+  rect(hx+2,hy+2,2,1, S.rimL?C(MU1):C(FG2));
+  // ears
+  rect(hx-5,hy+3,1,3,C(AC3));
+  rect(hx+5,hy+3,1,3,C(AC3));
+  setp(hx-5,hy+2,C(AC2)); setp(hx+5,hy+2,C(AC2));
+  // turned head: a sliver of face + one eye
+  if (hd<0){
+    rect(hx-6,hy+3,1,4,C(AC3));
+    setp(hx-6,hy+4, blink?C(AC3):C(FG0));
+  }
+  // rim light from the screen
+  if (S.rimL){
+    rect(hx+4,hy+1,1,7,C(MU2));
+    rect(hx+5,hy+2,1,5,C(MU1));
+    rect(102,59,2,1,C(MU2));
+    rect(103,60,1,3,C(MU1));
+  }
+  // arms / typing elbows
+  const ph = state.time*(S.typeRate*2.2);
+  const liftL = S.typing ? (Math.sin(ph)>0?1:0) : 0;
+  const liftR = S.typing ? (Math.sin(ph+Math.PI)>0?1:0) : 0;
+  const sx = state.surprise>0 && S.hp>0.5 ? 0.2 : S.hp;
+  if (S.stretch>0.25){
+    // arms up overhead
+    const a = S.stretch;
+    const ay = Math.round(hy - 5 - 5*a);
+    limb(88,60,87,ay+2,2,C(SF2));
+    limb(104,60,105,ay+2,2,C(SF2));
+    rect(86,ay,3,3,C(AC3));
+    rect(103,ay,3,3,C(AC3));
+    rect(hx-4,hy-1,9,1,C(FG0));
+  } else {
+    // elbows out, forearms toward the keyboard
+    line(89,62,86,68+liftL,C(SF2));
+    line(87,68+liftL,90,70,C(SF2));
+    line(103,62,106,68+liftR,C(SF2));
+    line(106,68+liftR,108,69,C(SF2));
+    rect(86,66+liftL,2,2,C(AC3));
+    // reaching up to put the headphones on
+    if (S.hp>0.06 && S.hp<0.94){
+      limb(104,61,102,52,2,C(SF2));
+      rect(100,50,3,2,C(AC3));
+    }
+  }
+  // headphones (white, outlined so they read against hair and wall)
+  if (sx>0.55){
+    rect(hx-3,hy-2,7,1,C(MU1));
+    rect(hx-4,hy-1,9,1,C(BG3));
+    rect(hx-4,hy,1,1,C(BG3));
+    rect(hx+4,hy,1,1,C(BG3));
+    rect(hx-7,hy+1,1,5,C(MU1));
+    rect(hx-6,hy+1,2,5,C(BG3));
+    rect(hx+5,hy+1,2,5,C(BG3));
+    rect(hx+6,hy+1,1,5,C(MU1));
+    rect(hx-6,hy+5,2,1,C(MU2));
+    rect(hx+5,hy+5,2,1,C(MU2));
+    // a day-lit glint keeps the white cans readable after dark
+    rect(hx-6,hy+2,1,1,C(BG3,0,true));
+    rect(hx+5,hy+2,1,1,C(BG3,0,true));
+    rect(hx-2,hy-1,5,1,C(BG3,0,true));
+  } else if (S.hp>0.08){
+    // lifting them from the neck
+    rect(hx-3,hy+8,7,1,C(BG3));
+    rect(hx-5,hy+7,2,2,C(BG3));
+    rect(hx+4,hy+7,2,2,C(BG3));
+  }
+  if (state.surprise>0){
+    rect(hx-1,hy-8,2,4,C(AC2));
+    rect(hx-1,hy-3,2,1,C(AC2));
+    rect(hx-1,hy-8,2,1,C(AC3,DL));
+  }
+  // cup raised for a sip
+  if (S.drink>0.25){
+    const d = S.drink;
+    const cx = 99, cy = Math.round(56 - 8*d);
+    line(102,62,103,58,C(SF2));
+    rect(cx,cy,3,3,C(BG3));
+    rect(cx,cy,3,1,C(AC0));
+    rect(cx+3,cy+1,1,1,C(BG3));
+    drawSteam(cx+1,cy-1,0.7,0.5);
+  }
+}
+
+function limb(x0,y0,x1,y1,w,code){
+  const n = Math.max(1, Math.abs(y1-y0));
+  for (let i=0;i<=n;i++){
+    const t=i/n;
+    rect(Math.round(lerp(x0,x1,t)), Math.round(lerp(y0,y1,t)), w, 1, code);
+  }
+}
+function drawWalker(){
+  const t = state.time;
+  const face = S.face>=0?1:-1;
+  const cx = Math.round(S.walkX);
+  const walk = S.walk;
+  const phase = walk ? t*9.2 : 0;
+  const sway = walk ? Math.sin(phase) : 0;
+  const jump = state.jumpT>0 ? -Math.round(Math.sin((1-state.jumpT/0.55)*Math.PI)*6) : 0;
+  const fy = 95 + jump;
+  const headY = 36 + jump;
+  // floor shadow
+  for (let i=0;i<14;i++) setp(cx-7+i, 95, (i%2 ? C(BG1,SH) : C(BG2,SH)));
+  const hipY = 66 + jump, footY = 93 + jump;
+  // legs (two solid 2px limbs, front/back stride)
+  const stride = walk ? Math.sin(phase)*3.2 : 0.8;
+  const legBack = Math.round(-stride), legFront = Math.round(stride);
+  limb(cx-1, hipY, cx-2+legBack, footY, 2, C(FG1));
+  limb(cx+1, hipY, cx+1+legFront, footY, 2, C(FG2));
+  rect(cx-3+legBack, footY+1, 4, 2, C(FG0));
+  rect(cx+0+legFront, footY+1, 4, 2, C(FG0));
+  // torso
+  rect(cx-3, headY+9, 7, 21, C(SF2));
+  rect(cx-3, headY+9, 1, 21, C(SF3));
+  rect(cx+3, headY+9, 1, 21, C(SF1));
+  rect(cx-2, headY+9, 5, 1, C(SF3));
+  // arm swing (opposite to the legs)
+  const arm = walk ? Math.sin(phase+Math.PI)*3.4 : 0.6;
+  limb(cx-3, headY+11, cx-4+Math.round(arm), headY+30, 2, C(SF2));
+  limb(cx+3, headY+11, cx+4-Math.round(arm), headY+30, 2, C(SF3));
+  setp(cx-4+Math.round(arm), headY+31, C(AC3));
+  setp(cx+4-Math.round(arm), headY+31, C(AC3));
+  if (S.carry){
+    const hx=cx+5*face, hy=headY+27;
+    rect(hx-1,hy,3,3,C(BG3));
+    rect(hx-1,hy,3,1,C(AC0));
+    rect(hx+2*face,hy+1,1,1,C(BG3));
+    drawSteam(hx,hy-1,0.6,0.9);
+  }
+  // head, side view
+  rect(cx-3, headY, 7, 9, C(AC3));
+  if (face>0) rect(cx-4, headY-1, 5, 10, C(FG0));
+  else rect(cx+1, headY-1, 5, 10, C(FG0));
+  rect(cx-2, headY-1, 4, 1, C(FG2));
+  // face
+  const ex = cx + 2*face;
+  setp(ex, headY+3, C(FG0));             // eye
+  setp(ex+face, headY+4, C(AC2));        // nose
+  setp(cx+1*face, headY+6, C(AC2));      // mouth
+  // neck
+  rect(cx-1, headY+9, 3, 1, C(AC2));
+  // rim from screen / window
+  if (S.rimL){
+    rect(cx+4*face, headY+1, 1, 7, C(MU2));
+    rect(cx+3*face, headY+10, 1, 14, C(MU1));
+  }
+  // standing at the shelf, one hand up at the kettle
+  if (S.stand && !walk && Math.abs(S.walkX-166)<3){
+    limb(cx+3, headY+12, cx+7, headY+15, 2, C(SF2));
+    rect(cx+7, headY+13, 2, 2, C(AC3));
+  }
+}
+
+/* ---- rug & sunlight ---- */
+function drawRug(){
+  const cx=96, cy=101, rx=39, ry=5;
+  for (let y=cy-ry;y<=cy+ry;y++){
+    for (let x=cx-rx;x<=cx+rx;x++){
+      const dx=(x-cx)/rx, dy=(y-cy)/ry;
+      const d=dx*dx+dy*dy;
+      if (d>1) continue;
+      let code;
+      if (d>0.80) code=C(MU1);
+      else if (d>0.70) code=C(MU2);
+      else if ((Math.abs(dx)>0.28 && Math.abs(dx)<0.36) || (d<0.25)) code=C(AC1);
+      else code=C(MU0);
+      setp(x,y,code);
+    }
+  }
+}
+function drawSun(){
+  if (S.sun<=0.02) return;
+  for (let y=96;y<=110;y++){
+    const u=(y-96)/14;
+    const x0=26+u*20, x1=62+u*20;
+    for (let x=Math.floor(x0);x<=Math.ceil(x1);x++){
+      const v=(x-x0)/Math.max(1,(x1-x0));
+      let a = (0.35+0.65*Math.sin(Math.PI*clamp(v,0,1)))*(1-u*0.5)*S.sun;
+      if (S.blinds>0.03){
+        const src = 20 + u*42;
+        if (mod(Math.floor(src),3) !== 2) continue;
+        a *= 1.15;
+      }
+      if (bayerAt(x,y) > a) continue;
+      setVar(x,y,DL);
+    }
+  }
+  // dust in the beam
+  if (!reduced){
+    for (let i=0;i<7;i++){
+      const ph = mod(state.time*0.08 + i*0.137, 1);
+      const x = Math.round(28 + i*5 + ph*26 + Math.sin(state.time*0.7+i)*2);
+      const y = Math.round(97 + mod(i*4.3 + ph*20, 12));
+      if (bayerAt(x,y) < 0.55) setp(x,y,C(BG3,DL,true));
+    }
+  }
+}
+
+/* ---- little flying messages ---- */
+function drawBubble(b){
+  if (b.phase==='bonk'){
+    const k = b.bonk;
+    const w = k<0.08 ? 7 : (k<0.18 ? 9 : 5);
+    const h = k<0.08 ? 5 : (k<0.18 ? 3 : 2);
+    const y = b.y + Math.round(Math.max(0,k-0.2)*9);
+    const fade = smooth(0.35,1.05,k);
+    if (fade>0.98) return;
+    if (fade>0.55 && bayerAt(b.x,y)<(fade-0.55)/0.45) return;
+    rect(b.x-w/2, y-h/2, w, h, C(BG3));
+    rect(b.x-w/2, y-h/2, w, 1, C(BG3,DL));
+    if (w>6){ setp(b.x-2,y,C(FG1)); setp(b.x,y,C(FG1)); setp(b.x+2,y,C(FG1)); }
+    return;
+  }
+  const sc = b.scale;
+  const w = Math.max(2, Math.round(3+5*sc));
+  const h = Math.max(1, Math.round(2+3*sc));
+  const x = Math.round(b.x), y = Math.round(b.y);
+  rect(x-w/2, y-h/2, w, h, C(BG3));
+  if (h>1) rect(x-w/2, y-h/2, w, 1, C(BG3,DL));
+  if (w>4){
+    const d = y;
+    setp(x-1,d,C(MU2)); setp(x+1,d,C(MU2));
+    if (w>7) setp(x+3,d,C(MU2));
+  }
+  // tail
+  setp(x-w/2+1, y+h/2, C(BG3));
+}
+
+/* ---- assembly ---- */
+function drawWorld(){
+  // wall everywhere (also the apron)
+  rect(-MW,-MW,WW,WH,C(BG2));
+  // ceiling + crown
+  rect(-MW,-MW,WW,MW+3,C(BG1));
+  rect(-MW,3,WW,1,C(BG0));
+  rect(-MW,4,WW,2,C(BG3));
+  rect(-MW,6,WW,1,C(BG1));
+  // soft shade at the top of the wall
+  rect(-MW,7,WW,1,C(BG1,SH));
+  rect(-MW,8,WW,1,C(BG2,SH));
+
+  // floor
+  const rowH=[1,1,2,2,3,3,4,5,6,7,10];
+  let yy=96, idx=0;
+  while (yy<126){
+    const rh = rowH[Math.min(idx,rowH.length-1)];
+    rect(-MW,yy,WW,rh,C(idx%2?AC0:AC1));
+    rect(-MW,yy,WW,1,C(AC0));
+    if (idx%2===0) rect(-MW,yy+1,WW,1,C(AC1));
+    const step = 24 + (idx%3)*9;
+    for (let x=-MW + mod(idx*13,step); x<MCW+MW; x+=step)
+      rect(x,yy+1,1,Math.max(1,rh-1),C(AC0,SH));
+    yy+=rh; idx++;
+  }
+  rect(-MW,96,WW,1,C(BG1,SH));
+  // wainscot + baseboard
+  rect(-MW,74,WW,1,C(BG2));
+  rect(-MW,75,WW,16,C(BG3));
+  for (let x=-MW;x<MCW+MW;x+=8) rect(x,76,1,14,C(BG2));
+  rect(-MW,91,WW,1,C(BG2));
+  rect(-MW,92,WW,4,C(BG3));
+  rect(-MW,92,WW,1,C(BG2));
+  rect(-MW,95,WW,1,C(BG1));
+  drawWindow();
+  drawPicture();
+  drawShelf();
+  // warm lamp wash on wall + shelf (light the room, not the screen)
+  if (S.lamp>0.02){
+    for (let y=16;y<64;y++) for (let x=118;x<182;x++){
+      if (x>=111 && x<=139 && y>=44 && y<=64) continue;
+      const dx=(x-150)/31, dy=(y-44)/30;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if (d>1) continue;
+      if (bayerAt(x,y) < (1-d)*0.55*S.lamp) setVar(x,y,DL);
+    }
+  }
+  drawRug();
+  drawSun();
+  drawDesk();
+  drawChair();
+  if (S.sit) drawSitter(); else drawWalker();
+  // lamp pool on the desk & objects after everything on it
+  if (S.lamp>0.02){
+    for (let y=54;y<74;y++) for (let x=120;x<162;x++){
+      if (x>=111&&x<=139&&y>=44&&y<=64) continue;
+      const dx=(x-144)/18, dy=(y-62)/12;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if (d>1) continue;
+      if (bayerAt(x,y) < (1-d)*0.7*S.lamp) setVar(x,y,LP);
+    }
+  }
+  // flying messages
+  for (const b of state.bubbles) drawBubble(b);
+  // kettle steam
+  if (S.kettle>0.02) drawSteam(172,50, S.kettle, 1.7);
+}
+
+/* ---- resolve material codes into colors (Bayer, no blending) ---- */
+function resolveWorld(){
+  const tc = timeColumn(S.h24);
+  let c0 = Math.floor(tc), c1 = Math.min(3,c0+1);
+  const frac = tc - c0;
+  const la = LUT[c0], lb = LUT[c1];
+  const day = LUT[0];
+  for (let y=0;y<WH;y++){
+    const row=y*WW;
+    const by=(y&3)*4;
+    for (let x=0;x<WW;x++){
+      const code = wbuf[row+x];
+      const v = (code>>5)&3;
+      let tab;
+      if (code & DAY) tab = day;
+      else if (frac>0 && frac>BAYER[by+(x&3)]) tab = lb; else tab = la;
+      w32[row+x] = tab[v][code&31];
+    }
+  }
+  wctx.putImageData(wimg,0,0);
+}
+
+/* ---- 72-column light field ---- */
+const LIGHT_N = 72;
+const lightRaw = new Float32Array(LIGHT_N*4);
+const lightF = new Float32Array(LIGHT_N*4);
+const lightBytes = new Uint8Array(LIGHT_N*4);
+let lampCentroid = 0.5, lampPower = 0;
+function addLightRange(x0,x1,w,R,G,B){
+  const a = clamp(Math.floor((x0+MW)/WW*LIGHT_N),0,LIGHT_N-1);
+  const b = clamp(Math.ceil ((x1+MW)/WW*LIGHT_N),0,LIGHT_N-1);
+  for (let c=a;c<=b;c++){
+    lightRaw[c*4]   += R*w;
+    lightRaw[c*4+1] += G*w;
+    lightRaw[c*4+2] += B*w;
+    lightRaw[c*4+3] += w;
+  }
+}
+function blurLight(r, mul){
+  const tmp = new Float32Array(LIGHT_N*4);
+  const norm = 1/(r*2+1);
+  for (let c=0;c<LIGHT_N;c++){
+    let R=0,G=0,B=0,A=0;
+    for (let d=-r;d<=r;d++){
+      const k = clamp(c+d,0,LIGHT_N-1)*4;
+      R+=lightRaw[k]; G+=lightRaw[k+1]; B+=lightRaw[k+2]; A+=lightRaw[k+3];
+    }
+    tmp[c*4]=R*norm*mul; tmp[c*4+1]=G*norm*mul; tmp[c*4+2]=B*norm*mul; tmp[c*4+3]=A*norm*mul;
+  }
+  lightRaw.set(tmp);
+}
+function buildLight(){
+  lightRaw.fill(0);
+  const daylight = 1-S.night;
+  if (S.open>0.01 || S.blinds<0.99){
+    const wndW = (1-S.blinds*0.9) * (0.22 + 0.78*daylight) * 0.9;
+    if (wndW>0.01) addLightRange(22,60, wndW, 0.85,0.93,1.0);
+  }
+  if (S.lamp>0.02){
+    addLightRange(140,156, S.lamp*1.55, 1.0,0.66,0.30);
+    lampPower = S.lamp;
+    lampCentroid = (147+MW)/WW;
+  } else lampPower = 0;
+  // the daylight strips between the blind slats still glow at night
+  if (S.blinds>0.5){
+    addLightRange(22,60, 0.34, 0.78,0.86,1.0);
+  }
+  const scr = S.screenChat>0.5 ? 0.85 : 0.7;
+  addLightRange(113,136, scr, S.screenChat>0.5?0.95:0.60, S.screenChat>0.5?0.98:0.78, S.screenChat>0.5?0.92:1.0);
+  if (state.phoneLit>0.1) addLightRange(70,78, state.phoneLit*0.5, 0.55,0.75,1.0);
+  blurLight(1,1); blurLight(1,1); blurLight(3,0.55); blurLight(3,0.55);
+  for (let c=0;c<LIGHT_N;c++){
+    const A = lightRaw[c*4+3];
+    const k = A>0 ? Math.min(1.15, A*0.8)/A : 0;
+    lightBytes[c*4]   = Math.round(clamp(lightRaw[c*4]*k,0,1)*255);
+    lightBytes[c*4+1] = Math.round(clamp(lightRaw[c*4+1]*k,0,1)*255);
+    lightBytes[c*4+2] = Math.round(clamp(lightRaw[c*4+2]*k,0,1)*255);
+    lightBytes[c*4+3] = Math.round(clamp(A*0.8,0,1)*255);
+  }
+}
+
+/* ---- per-frame world update (called at 30 Hz) ---- */
+function updateWorld(){
+  drawWorld();
+  resolveWorld();
+  buildLight();
+}
+
+
+/* ------------------------------------------------------------------ *
+ * 11. WebGL2 compositor
+ * ------------------------------------------------------------------ */
+const VERT = `#version 300 es
+layout(location=0) in vec2 p;
+void main(){ gl_Position = vec4(p,0.0,1.0); }
+`;
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 outColor;
+
+uniform vec2  uRes;
+uniform float uDpr;
+uniform vec2  uCapC;
+uniform vec2  uCapH;
+uniform float uShell;
+uniform vec2  uWinC;
+uniform vec2  uWinH;
+uniform vec2  uLens;
+uniform vec2  uLensS;
+uniform float uLensR;
+uniform float uPress;
+uniform float uK;
+uniform vec2  uWorldC;
+uniform vec2  uWorldSize;
+uniform float uMargin;
+uniform float uNight;
+uniform float uFocus;
+uniform float uLampI;
+uniform vec2  uLampW;
+uniform float uTime;
+uniform sampler2D uWorld;
+uniform sampler2D uLight;
+uniform float uLightN;
+uniform vec3  uShellDay;
+uniform vec3  uShellFocus;
+uniform vec3  uWarm;
+
+float hash21(vec2 p){
+  p = fract(p*vec2(123.34,456.21));
+  p += dot(p,p+45.32);
+  return fract(p.x*p.y);
+}
+float sdStadium(vec2 p, vec2 half_){
+  float rad = half_.y;
+  vec2 q = abs(p) - vec2(max(half_.x-rad,0.0),0.0);
+  return length(max(q,0.0)) + min(max(q.x,q.y),0.0) - rad;
+}
+vec3 sampleWorld(vec2 room){
+  vec2 g = (room + vec2(uMargin)) / uWorldSize;
+  vec2 ip = floor(g * uWorldSize);
+  ivec2 t = ivec2(clamp(ip, vec2(0.0), uWorldSize - 1.0));
+  return texelFetch(uWorld, t, 0).rgb;
+}
+vec3 lightAt(vec2 room){
+  float u = (room.x + uMargin) / uWorldSize.x;
+  float x = clamp(u,0.0,1.0)*uLightN - 0.5;
+  float i = floor(x);
+  float f = x - i;
+  float w0 = (1.0-f)*(1.0-f)*(1.0-f)/6.0;
+  float w1 = (3.0*f*f*f - 6.0*f*f + 4.0)/6.0;
+  float w2 = (-3.0*f*f*f + 3.0*f*f + 3.0*f + 1.0)/6.0;
+  float w3 = f*f*f/6.0;
+  int base = int(i)-1;
+  vec4 acc = vec4(0.0);
+  acc += texelFetch(uLight, ivec2(clamp(base,0,int(uLightN)-1),0), 0) * w0;
+  acc += texelFetch(uLight, ivec2(clamp(base+1,0,int(uLightN)-1),0), 0) * w1;
+  acc += texelFetch(uLight, ivec2(clamp(base+2,0,int(uLightN)-1),0), 0) * w2;
+  acc += texelFetch(uLight, ivec2(clamp(base+3,0,int(uLightN)-1),0), 0) * w3;
+  return acc.rgb;
+}
+
+void main(){
+  vec2 fc = gl_FragCoord.xy / uDpr;
+  fc.y = uRes.y - fc.y;
+
+  vec2 pc = fc - uCapC;
+  float dCap = sdStadium(pc, uCapH);
+  vec2 pw = fc - uWinC;
+  float dWin = sdStadium(pw, uWinH);
+  vec2 room = (fc - uWinC)/uK + uWorldC;
+
+  vec3 col = vec3(0.0);
+
+  if (dWin <= 0.0){
+    /* ---------------- window: the pixel world ---------------- */
+    vec3 flatC = sampleWorld(room);
+    float ty = (pw.y + uWinH.y) / (2.0*uWinH.y);
+    flatC *= mix(0.60, 1.0, smoothstep(0.0, 0.12, ty));
+    float din = -dWin;
+    flatC *= mix(0.50, 1.0, smoothstep(0.0, 4.5, din));
+    float du = (pw.x/uWinH.x)*0.62 + (pw.y/uWinH.y)*0.38;
+    float sheen = 1.0 - smoothstep(0.02, 0.40, abs(du-0.10));
+    flatC += vec3(0.045,0.045,0.04)*sheen;
+    float hi = exp(-pow(((pw.x/uWinH.x)*0.8 + (pw.y/uWinH.y)*0.55 - 0.42)/0.42, 2.0))*0.045;
+    flatC += vec3(1.0,0.98,0.94)*hi;
+
+    /* lens drop shadow on the picture */
+    vec2 shC = uLens + vec2(2.0, 7.0 + 9.0*uPress);
+    vec2 shq = (fc - shC) / (vec2(uLensR*uLensS.x*1.03, uLensR*uLensS.y*1.06) * (1.0 + 0.09*uPress));
+    float dsh = length(shq);
+    float sh = (1.0 - smoothstep(0.52, 1.06, dsh)) * (0.30 + 0.14*uPress);
+    flatC *= 1.0 - sh;
+
+    /* the liquid glass lens */
+    vec2 lq = (fc - uLens) / vec2(uLensR*uLensS.x, uLensR*uLensS.y);
+    float ld = length(lq);
+    if (ld < 1.0){
+      float f = mix(1.0/1.24, 1.72, smoothstep(0.70, 1.0, ld));
+      float disp = smoothstep(0.55, 1.0, ld) * 0.05;
+      vec2 off = fc - uLens;
+      vec2 lw = (uLens - uWinC)/uK + uWorldC;
+      vec3 rc;
+      rc.r = sampleWorld(lw + off*(f*(1.0+disp))/uK).r;
+      rc.g = sampleWorld(lw + off*(f        )/uK).g;
+      rc.b = sampleWorld(lw + off*(f*(1.0-disp))/uK).b;
+      rc *= vec3(0.995, 1.0, 1.012);
+      rc *= mix(1.0, 0.34, smoothstep(0.86, 1.0, ld));
+      rc *= 1.0 - 0.055*smoothstep(0.50, 0.86, ld);
+      vec2 nq = lq / max(ld, 1e-4);
+      float lower = smoothstep(-0.30, 0.90, nq.y);
+      float ring = smoothstep(0.70, 0.92, ld) * (1.0 - smoothstep(0.955, 1.0, ld));
+      rc += vec3(1.0, 0.86, 0.64) * ring * lower * 0.30;
+      vec2 hq = (lq - vec2(-0.18, -0.56)) / vec2(0.60, 0.22);
+      rc += vec3(1.0, 0.99, 0.96) * exp(-dot(hq,hq)*1.25) * 0.13;
+      vec2 hq2 = (lq - vec2(-0.46, -0.34)) / vec2(0.20, 0.09);
+      rc += vec3(1.0) * exp(-dot(hq2,hq2)*2.0) * 0.10;
+      rc *= 1.0 - 0.45*smoothstep(0.93, 1.0, ld);
+      flatC = rc;
+    }
+
+    /* light field is screened onto window & lens */
+    vec3 li = lightAt(room);
+    flatC = 1.0 - (1.0-flatC)*(1.0-clamp(li*0.85, 0.0, 1.0));
+    col = flatC;
+
+  } else {
+    /* ---------------- shell: polished, thick, rounded ---------------- */
+    float t = clamp(-dCap/uShell, 0.0, 1.0);
+    vec2 g2 = normalize(vec2(dFdx(dCap), dFdy(dCap)) + vec2(1e-6));
+    float s = 1.0 - t;
+    float z = sqrt(max(1.0 - s*s, 0.0));
+    float sl = s / max(z, 0.10);
+    vec3 N = normalize(vec3(g2*sl*0.72, 1.0));
+
+    vec3 base = mix(uShellDay, uShellFocus, smoothstep(0.22, 0.92, uFocus));
+    base *= mix(1.0, 0.44, uNight);
+    base *= mix(0.70, 1.0, smoothstep(0.0, 0.10, t));
+    base *= mix(1.0, 0.58, smoothstep(0.76, 1.0, t));
+
+    vec2 lampScr = uWinC + (uLampW - uWorldC)*uK;
+    float dl = length(fc - lampScr);
+    float warm = exp(-dl/(uWinH.y*0.85)) * uLampI;
+    base = mix(base, base*1.10 + uWarm*0.16, clamp(warm*0.9, 0.0, 1.0));
+
+    vec3 V = vec3(0.0,0.0,1.0);
+    vec3 R = reflect(-V, N);
+    float box = smoothstep(0.30, 0.94, dot(normalize(R+vec3(0.0,0.0,0.18)), normalize(vec3(-0.45,0.82,0.38))));
+    float fill = smoothstep(0.60, 1.0, dot(normalize(R+vec3(0.0,0.0,0.20)), vec3(0.05,-0.95,0.30)));
+    float F = 0.035 + 0.965*pow(1.0 - clamp(N.z,0.0,1.0), 5.0);
+    col = base * (0.80 + 0.20*N.z);
+    col += vec3(1.0,0.985,0.945) * (box*0.52 + fill*0.05) * (0.35 + 0.65*F);
+    col += vec3(1.0,0.96,0.86) * F * 0.10;
+    col *= mix(0.55, 1.0, smoothstep(0.0, 2.2, dWin));
+    col += uWarm * warm * 0.10;
+  }
+
+  /* ---------------- outside: shadows + warm leak ---------------- */
+  float ds1 = sdStadium(fc - uCapC - vec2(0.0, 9.0), uCapH);
+  float ds2 = sdStadium(fc - uCapC - vec2(0.0, 20.0), uCapH + vec2(7.0, 0.0));
+  float sh1 = exp(-max(ds1,0.0)/16.0) * 0.22;
+  float sh2 = exp(-max(ds2,0.0)/52.0) * 0.11;
+  float aSh = clamp(sh1+sh2, 0.0, 0.42);
+  float dOut = max(dCap, 0.0);
+  float side = 0.35 + 0.65*smoothstep(0.0, 1.0, (fc.x-uCapC.x)/uCapH.x);
+  float leak = exp(-dOut/58.0) * uLampI * 0.62 * side;
+  vec3 leakC = uWarm * leak;
+  float aOut = clamp(aSh + leak*0.55, 0.0, 0.9);
+  vec3 outCol = (vec3(0.035,0.04,0.055)*aSh + leakC) / max(aOut, 1e-4);
+
+  float aa = max(fwidth(dCap), 0.70);
+  float inW = clamp(0.5 - dCap/aa, 0.0, 1.0);
+  vec3 finalCol = mix(outCol, col, inW);
+  float finalA = clamp(inW + (1.0-inW)*aOut, 0.0, 1.0);
+  finalCol += (hash21(floor(fc)) - 0.5) * (1.5/255.0);
+  outColor = vec4(finalCol, finalA);
+}
+`;
+
+let gl = null, prog = null, u = {}, vao = null, worldTex = null, lightTex = null;
+let worldDirty = true, lightDirty = true;
+let glReady = false;
+let force2D = false;
+let glChecked = false;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    console.error(gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+function probeGL(){
+  let g = null;
+  try {
+    const c = document.createElement('canvas');
+    c.width = 4; c.height = 4;
+    g = c.getContext('webgl2', {alpha:true, antialias:false, premultipliedAlpha:false, depth:false, stencil:false});
+    if (!g) return false;
+    const sh = (type, src) => {
+      const s = g.createShader(type);
+      g.shaderSource(s, src);
+      g.compileShader(s);
+      return g.getShaderParameter(s, g.COMPILE_STATUS) ? s : null;
+    };
+    const vs = sh(g.VERTEX_SHADER, VERT);
+    const fs = sh(g.FRAGMENT_SHADER, FRAG);
+    if (!vs || !fs) return false;
+    const p = g.createProgram();
+    g.attachShader(p, vs); g.attachShader(p, fs); g.linkProgram(p);
+    return !!g.getProgramParameter(p, g.LINK_STATUS);
+  } catch(e){
+    return false;
+  }
+}
+function initGL(){
+  // test the driver on a throw-away canvas first, so a shader failure
+  // never leaves the visible canvas locked to a WebGL context
+  if (!probeGL()){ console.warn('WebGL2 shader probe failed'); return false; }
+  try {
+    gl = view.getContext('webgl2', {alpha:true, antialias:true, premultipliedAlpha:false, depth:false, stencil:false, powerPreference:'high-performance'});
+  } catch(e){ gl = null; }
+  if (!gl){ console.warn('WebGL2 unavailable'); return false; }
+  const vs = compile(gl.VERTEX_SHADER, VERT);
+  const fs = compile(gl.FRAGMENT_SHADER, FRAG);
+  if (!vs || !fs){ document.title = 'SHADER COMPILE FAIL'; return false; }
+  prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+    console.error(gl.getProgramInfoLog(prog));
+    return false;
+  }
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const names = ['uRes','uDpr','uCapC','uCapH','uShell','uWinC','uWinH','uLens','uLensS',
+    'uLensR','uPress','uK','uWorldC','uWorldSize','uMargin','uNight','uFocus','uLampI',
+    'uLampW','uTime','uWorld','uLight','uLightN','uShellDay','uShellFocus','uWarm'];
+  for (const n of names) u[n] = gl.getUniformLocation(prog, n);
+
+  worldTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, worldTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, wcanvas);
+
+  lightTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, lightTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, LIGHT_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lightBytes);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0,0,0,0);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  glReady = true;
+  return true;
+}
+function uploadWorld(){
+  if (!glReady) return;
+  gl.bindTexture(gl.TEXTURE_2D, worldTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, wcanvas);
+  worldDirty = false;
+}
+function uploadLight(){
+  if (!glReady) return;
+  gl.bindTexture(gl.TEXTURE_2D, lightTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, LIGHT_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lightBytes);
+  lightDirty = false;
+}
+const col3 = (i,v=1) => [PALETTE[i].rgb[0]/255*v, PALETTE[i].rgb[1]/255*v, PALETTE[i].rgb[2]/255*v];
+
+function renderGL(){
+  if (!glReady) return;
+  if (worldDirty) uploadWorld();
+  if (lightDirty) uploadLight();
+  gl.viewport(0,0,view.width,view.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+
+  const s = state;
+  const st = reduced ? 0 : s.stretch;
+  const sx = (1 + 0.2*st) * (1 + 0.012*s.lift);
+  const sy = (1 - 0.075*st) * (1 + 0.012*s.lift);
+  const rawX = G.lensMin + s.pos*(G.lensMax - G.lensMin);
+  const radX = Math.max(1, G.lensR*Math.abs(sx));
+  const lensX = clamp(rawX, (G.winCX - G.winW/2) + radX + 0.6,
+                             (G.winCX + G.winW/2) - radX - 0.6);
+  const lensY = G.winCY - 2.0*s.lift;
+
+  gl.uniform2f(u.uRes, G.w, G.h);
+  gl.uniform1f(u.uDpr, G.dpr);
+  gl.uniform2f(u.uCapC, G.cx, G.cy);
+  gl.uniform2f(u.uCapH, G.capW/2, G.capH/2);
+  gl.uniform1f(u.uShell, G.shell);
+  gl.uniform2f(u.uWinC, G.winCX, G.winCY);
+  gl.uniform2f(u.uWinH, G.winW/2, G.winH/2);
+  gl.uniform2f(u.uLens, lensX, lensY);
+  gl.uniform2f(u.uLensS, sx, sy);
+  gl.uniform1f(u.uLensR, G.lensR);
+  gl.uniform1f(u.uPress, s.lift);
+  gl.uniform1f(u.uK, G.k);
+  gl.uniform2f(u.uWorldC, 96, 56);
+  gl.uniform2f(u.uWorldSize, WW, WH);
+  gl.uniform1f(u.uMargin, MW);
+  gl.uniform1f(u.uNight, S.night);
+  gl.uniform1f(u.uFocus, smooth(0.18, 0.95, s.pos));
+  gl.uniform1f(u.uLampI, S.lamp);
+  gl.uniform2f(u.uLampW, 147, 54);
+  gl.uniform1f(u.uTime, state.time);
+  gl.uniform1f(u.uLightN, LIGHT_N);
+  gl.uniform3fv(u.uShellDay, col3(3));
+  gl.uniform3fv(u.uShellFocus, col3(9));
+  gl.uniform3fv(u.uWarm, [1.0, 0.72, 0.40]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, worldTex);
+  gl.uniform1i(u.uWorld, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lightTex);
+  gl.uniform1i(u.uLight, 1);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindVertexArray(null);
+
+  // one-time sanity check: if the driver "succeeded" but produced nothing,
+  // switch to the 2D renderer before the page looks blank
+  if (!glChecked){
+    glChecked = true;
+    let ok = true;
+    try {
+      const px = new Uint8Array(4);
+      const sx = clamp(Math.round(G.cx*G.dpr), 0, view.width-1);
+      const sy = clamp(view.height - 1 - Math.round(G.cy*G.dpr), 0, view.height-1);
+      gl.readPixels(sx, sy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      ok = px[3] > 8 && (px[0]+px[1]+px[2]) > 10;
+    } catch(e){ ok = true; }
+    if (!ok){
+      force2D = true;
+      swapTo2D();
+      render2D();
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 12. 2D fallback — world in a capsule clip + translucent round slider
+ * ------------------------------------------------------------------ */
+let ctx2 = null;
+function init2D(){
+  if (!ctx2) ctx2 = view.getContext('2d');
+  return !!ctx2;
+}
+function swapTo2D(){
+  glReady = false;
+  gl = null;
+  try {
+    const fresh = view.cloneNode(false);
+    fresh.width = G.bufW;
+    fresh.height = G.bufH;
+    view.replaceWith(fresh);
+    view = fresh;
+  } catch(e){}
+  ctx2 = null;
+  init2D();
+}
+function render2D(){
+  if (!ctx2 && !init2D()) return;
+  const ctx = ctx2;
+  const w = G.w, h = G.h;
+  ctx.setTransform(G.dpr,0,0,G.dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+
+  const capH = G.capH, capW = G.capW, cx = G.cx, cy = G.cy;
+  const rad = capH/2, lx = cx-capW/2, ly = cy-capH/2;
+  const shell = G.shell;
+  const winX = cx-G.winW/2, winY = cy-G.winH/2;
+
+  // soft double shadow
+  const sh = (off, spread, alpha) => {
+    ctx.save();
+    ctx.filter = `blur(${spread}px)`;
+    ctx.fillStyle = `rgba(20,22,38,${alpha})`;
+    roundRectPath(ctx, lx, ly+off, capW, capH, rad);
+    ctx.fill();
+    ctx.restore();
+  };
+  sh(10, 18, 0.18);
+  sh(24, 40, 0.10);
+
+  // shell (day / focus mix, night dimmed)
+  const foc = smooth(0.18,0.95,state.pos);
+  const mixc = (a,b,t) => a.map((v,i)=>Math.round(lerp(v,b[i],t)));
+  const dayC = [PALETTE[3].rgb[0],PALETTE[3].rgb[1],PALETTE[3].rgb[2]];
+  const focC = [PALETTE[9].rgb[0],PALETTE[9].rgb[1],PALETTE[9].rgb[2]];
+  const dim = t => mixc(t, [10,12,30], S.night*0.55);
+  const baseC = dim(mixc(dayC, focC, foc));
+  const shellGrad = ctx.createLinearGradient(lx, ly, lx, ly+capH);
+  shellGrad.addColorStop(0, `rgb(${baseC.map(v=>Math.min(255,v*1.18)).join(',')})`);
+  shellGrad.addColorStop(0.45, `rgb(${baseC.join(',')})`);
+  shellGrad.addColorStop(1, `rgb(${baseC.map(v=>Math.round(v*0.55)).join(',')})`);
+  roundRectPath(ctx, lx, ly, capW, capH, rad);
+  ctx.fillStyle = shellGrad;
+  ctx.fill();
+
+  // window clip + world
+  ctx.save();
+  roundRectPath(ctx, winX, winY, G.winW, G.winH, G.winH/2);
+  ctx.clip();
+  // interior base
+  ctx.fillStyle = `rgb(${dim([50,46,60]).join(',')})`;
+  ctx.fillRect(winX, winY, G.winW, G.winH);
+  const k = G.k;
+  const dw = WW*k, dh = WH*k;
+  const dx = cx - (96 + MW)*k, dy = cy - (56 + MW)*k;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(wcanvas, dx, dy, dw, dh);
+  // top inner shade
+  const g = ctx.createLinearGradient(0, winY, 0, winY+G.winH*0.16);
+  g.addColorStop(0,'rgba(10,12,26,0.5)'); g.addColorStop(1,'rgba(10,12,26,0)');
+  ctx.fillStyle = g; ctx.fillRect(winX, winY, G.winW, G.winH*0.2);
+  // broad glass sheen
+  const gg = ctx.createLinearGradient(winX, winY, winX+G.winW*0.7, winY+G.winH);
+  gg.addColorStop(0.25,'rgba(255,255,255,0)');
+  gg.addColorStop(0.5,'rgba(255,250,235,0.09)');
+  gg.addColorStop(0.62,'rgba(255,255,255,0)');
+  ctx.fillStyle = gg; ctx.fillRect(winX, winY, G.winW, G.winH);
+  // lamp glow
+  if (S.lamp>0.02){
+    const lxr = winX + (147/192)*G.winW*1.0;
+    const rg = ctx.createRadialGradient(lxr, winY+G.winH*0.5, 0, lxr, winY+G.winH*0.5, G.winH*0.9);
+    rg.addColorStop(0, `rgba(255,180,90,${0.28*S.lamp})`);
+    rg.addColorStop(1,'rgba(255,180,90,0)');
+    ctx.fillStyle = rg; ctx.fillRect(winX,winY,G.winW,G.winH);
+  }
+  ctx.restore();
+
+  // inner rim dark line
+  roundRectPath(ctx, winX+1, winY+1, G.winW-2, G.winH-2, (G.winH-2)/2);
+  ctx.strokeStyle = 'rgba(20,18,30,0.55)';
+  ctx.lineWidth = 2; ctx.stroke();
+
+  // lens
+  const lR = G.lensR*(1+0.012*state.lift);
+  const lxp = G.lensMin + state.pos*(G.lensMax-G.lensMin);
+  const lyp = G.winCY - 2*state.lift;
+  ctx.save();
+  ctx.filter = 'blur(7px)';
+  ctx.fillStyle = 'rgba(15,14,26,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(lxp+3, lyp+10, lR*0.98, lR*0.98, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+  const lg = ctx.createRadialGradient(lxp-lR*0.35, lyp-lR*0.4, lR*0.05, lxp, lyp, lR);
+  lg.addColorStop(0,'rgba(255,255,255,0.30)');
+  lg.addColorStop(0.55,'rgba(240,245,255,0.10)');
+  lg.addColorStop(0.88,'rgba(255,255,255,0.06)');
+  lg.addColorStop(1,'rgba(15,18,35,0.35)');
+  ctx.beginPath();
+  ctx.arc(lxp, lyp, lR, 0, Math.PI*2);
+  ctx.fillStyle = lg; ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.ellipse(lxp-lR*0.2, lyp-lR*0.55, lR*0.5, lR*0.18, -0.35, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fill();
+}
+function roundRectPath(ctx, x, y, w, h, r){
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+
+
+
+/* ------------------------------------------------------------------ *
+ * 13. Lifecycle, resize, main loop
+ * ------------------------------------------------------------------ */
+window.addEventListener('error', e => { console.error('page error', e.message||''); });
+let raf = 0, running = false, lastNow = 0, visible = true;
+let worldDue = 0, worldReady = false;
+let idleFrames = 0;
+
+function resize(){
+  if (!layout()) return;
+  view.width = G.bufW;
+  view.height = G.bufH;
+  if (!force2D && !gl && !glReady) {
+    if (!initGL()){
+      force2D = true;
+      init2D();
+      if (!ctx2) swapTo2D();
+    }
+  }
+  kick();
+  state.dirty = true;
+}
+
+function update(dt){
+  stepMotion(dt);
+  updateStory(dt);
+  updateBubbles(dt);
+  worldDue += dt;
+  if (!worldReady || worldDue >= 1/30){
+    worldDue = 0;
+    updateWorld();
+    worldReady = true;
+    worldDirty = true;
+    lightDirty = true;
+  }
+  state.dirty = true;
+}
+
+function render(){
+  if (glReady) renderGL();
+  else render2D();
+}
+
+function frame(now){
+  if (!running) return;
+  raf = requestAnimationFrame(frame);
+  const dt = clamp((now - lastNow)/1000, 0.001, 0.05);
+  lastNow = now;
+  update(dt);
+  render();
+  if (reduced){
+    if (isIdle()){
+      idleFrames++;
+      if (idleFrames > 6) stopLoop();
+    } else idleFrames = 0;
+  }
+}
+function isIdle(){
+  const s = state;
+  if (s.drag) return false;
+  if (Math.abs(s.target - s.pos) > 0.0012) return false;
+  if (Math.abs(s.vel) > 0.002) return false;
+  if (s.lift > 0.01) return false;
+  if (Math.abs(s.stretch) > 0.01) return false;
+  if (s.surprise > 0 || s.jumpT > 0) return false;
+  if (s.bubbles.length) return false;
+  if (s.mode === 'fwd' && s.pos > 0.9975) return false; // the evening is still moving
+  return true;
+}
+function startLoop(){
+  if (running || !visible || document.hidden) return;
+  running = true;
+  idleFrames = 0;
+  lastNow = performance.now();
+  raf = requestAnimationFrame(frame);
+}
+function stopLoop(){
+  running = false;
+  if (raf) cancelAnimationFrame(raf);
+  raf = 0;
+}
+function kick(){
+  state.dirty = true;
+  state.idle = 0;
+  startLoop();
+}
+
+// reduced motion preference
+const onRM = () => {
+  reduced = REDUCE_MQ.matches;
+  kick();
+};
+if (REDUCE_MQ.addEventListener) REDUCE_MQ.addEventListener('change', onRM);
+else if (REDUCE_MQ.addListener) REDUCE_MQ.addListener(onRM);
+
+// pause when off screen
+if ('IntersectionObserver' in window){
+  new IntersectionObserver(entries => {
+    for (const e of entries){
+      visible = e.isIntersecting;
+      if (visible) startLoop(); else stopLoop();
+    }
+  }, {threshold:0}).observe(stage);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopLoop();
+  else startLoop();
+});
+window.addEventListener('resize', resize);
+if ('ResizeObserver' in window){
+  let rtod = 0;
+  new ResizeObserver(() => {
+    cancelAnimationFrame(rtod);
+    rtod = requestAnimationFrame(resize);
+  }).observe(widget);
+}
+view.addEventListener('webglcontextlost', e => {
+  e.preventDefault();
+  force2D = true;
+  swapTo2D();
+  kick();
+});
+
+// initial state
+btn.setAttribute('aria-checked', state.on ? 'true' : 'false');
+layout();
+resize();
+updateStory(0);
+if (!worldReady){ updateWorld(); worldReady = true; worldDirty = true; lightDirty = true; }
+render();
+startLoop();
+
+})();
+
+</script>
+</body>
+</html>
+
