@@ -4,9 +4,9 @@ An agent **skill** for building — and repairing — single-file pixel-art web 
 
 **Live demo:** https://tiandihuang.github.io/pixel-art-webgl-component/ — drag the lens, click it, or focus the switch and use the arrow keys.
 
-[![The reference focus-mode switch](assets/preview.png)](https://tiandihuang.github.io/pixel-art-webgl-component/)
+[![Animated preview: dragging the focus switch from noon to night and back](assets/preview.gif)](https://tiandihuang.github.io/pixel-art-webgl-component/)
 
-*The reference example at 1600×900: a focus-mode switch whose slider is a liquid-glass lens.*
+*The preview above is a 2.5 s recording of a real drag: day → dusk → night, then the return. Click it for the live, interactive version.*
 
 ## What this is
 
@@ -34,8 +34,10 @@ This repository is a skill — a folder of instructions, references, reusable sc
 | `references/interaction-and-a11y.md` | Drag/spring physics, two-road clock, ARIA/change/live region, reduced motion, fallbacks |
 | `references/verification-and-diagnosis.md` | Screenshot/CDP harnesses, ASCII inspector, blank/beige decision tree, IE and high-DPI traps |
 | `references/worked-example.md` | A map of the reference file: constants, what to adapt, deliberate oddities |
+| `index.html` | GitHub Pages entry: a full-viewport iframe of the worked example |
 | `assets/reference-focus-switch.html` | The complete 72 KB worked example |
-| `assets/preview.png` | The preview above |
+| `assets/preview.gif` | The animated preview above (2.5 s, 21 frames) |
+| `assets/preview.png` | A still frame of the worked example |
 | `scripts/shot.ps1` | Headless Chrome screenshots (GPU, SwiftShader, 2D-only, reduced motion, virtual time) |
 | `scripts/chrome-cdp.ps1` | Launch a debug Chrome with the DevTools port |
 | `scripts/cdp-probe.mjs` | Drive a real click/keyboard, read ARIA and the stage background, capture errors |
